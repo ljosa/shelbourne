@@ -1,3 +1,9 @@
 <ShepherdConfig>
+  <daemon name="/bin/ntpd"
+          recovery="ignore">
+    <arg>-n</arg>
+    <arg>-p</arg>
+    <arg>129.6.15.28</arg>
+  </daemon>
   <daemon name="/mnt/nv/player"/>
 </ShepherdConfig>

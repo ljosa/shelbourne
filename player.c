@@ -5,20 +5,20 @@
  *   Volume Up/Down  = Adjust volume (+/- 5, minimum 5)
  *   Preset 1-4      = Select source (press again to cycle)
  *   AUX             = Switch to AUX input
- *   Power           = Pause/Play (radio/USB), Mute (AUX)
+ *   Power           = Return to idle (clock) screen
  */
 
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 #include "shelbourne.h"
 #include "station_logos.h"
+#include "display.h"
+#include "net.h"
 
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
-#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,7 +149,7 @@ static struct {
 
     /* Commands */
     volatile int cmd_quit;
-    volatile int cmd_pause;
+    volatile int cmd_off;
     volatile int cmd_aux;
     volatile int cmd_preset;  /* 0-5, or -1 for none */
 
@@ -210,216 +210,6 @@ static int convert_and_write(const mp3d_sample_t *pcm,
     return 0;
 }
 
-/* ── 5x7 bitmap font ──────────────────────────────────────────── */
-
-#define FONT_W 5
-#define FONT_H 7
-#define CHAR_W 6
-
-/* 2x scaled font metrics */
-#define BIG_CHAR_W 12
-#define BIG_CHAR_H 16
-#define BIG_COLS   (SHELBOURNE_FB_WIDTH / BIG_CHAR_W)  /* 10 */
-
-static const uint8_t font5x7[][5] = {
-    {0x00,0x00,0x00,0x00,0x00}, /*   */
-    {0x00,0x00,0x5f,0x00,0x00}, /* ! */
-    {0x00,0x07,0x00,0x07,0x00}, /* " */
-    {0x14,0x7f,0x14,0x7f,0x14}, /* # */
-    {0x24,0x2a,0x7f,0x2a,0x12}, /* $ */
-    {0x23,0x13,0x08,0x64,0x62}, /* % */
-    {0x36,0x49,0x55,0x22,0x50}, /* & */
-    {0x00,0x05,0x03,0x00,0x00}, /* ' */
-    {0x00,0x1c,0x22,0x41,0x00}, /* ( */
-    {0x00,0x41,0x22,0x1c,0x00}, /* ) */
-    {0x14,0x08,0x3e,0x08,0x14}, /* * */
-    {0x08,0x08,0x3e,0x08,0x08}, /* + */
-    {0x00,0x50,0x30,0x00,0x00}, /* , */
-    {0x08,0x08,0x08,0x08,0x08}, /* - */
-    {0x00,0x60,0x60,0x00,0x00}, /* . */
-    {0x20,0x10,0x08,0x04,0x02}, /* / */
-    {0x3e,0x51,0x49,0x45,0x3e}, /* 0 */
-    {0x00,0x42,0x7f,0x40,0x00}, /* 1 */
-    {0x42,0x61,0x51,0x49,0x46}, /* 2 */
-    {0x21,0x41,0x45,0x4b,0x31}, /* 3 */
-    {0x18,0x14,0x12,0x7f,0x10}, /* 4 */
-    {0x27,0x45,0x45,0x45,0x39}, /* 5 */
-    {0x3c,0x4a,0x49,0x49,0x30}, /* 6 */
-    {0x01,0x71,0x09,0x05,0x03}, /* 7 */
-    {0x36,0x49,0x49,0x49,0x36}, /* 8 */
-    {0x06,0x49,0x49,0x29,0x1e}, /* 9 */
-    {0x00,0x36,0x36,0x00,0x00}, /* : */
-    {0x00,0x56,0x36,0x00,0x00}, /* ; */
-    {0x08,0x14,0x22,0x41,0x00}, /* < */
-    {0x14,0x14,0x14,0x14,0x14}, /* = */
-    {0x00,0x41,0x22,0x14,0x08}, /* > */
-    {0x02,0x01,0x51,0x09,0x06}, /* ? */
-    {0x32,0x49,0x79,0x41,0x3e}, /* @ */
-    {0x7e,0x11,0x11,0x11,0x7e}, /* A */
-    {0x7f,0x49,0x49,0x49,0x36}, /* B */
-    {0x3e,0x41,0x41,0x41,0x22}, /* C */
-    {0x7f,0x41,0x41,0x22,0x1c}, /* D */
-    {0x7f,0x49,0x49,0x49,0x41}, /* E */
-    {0x7f,0x09,0x09,0x09,0x01}, /* F */
-    {0x3e,0x41,0x49,0x49,0x7a}, /* G */
-    {0x7f,0x08,0x08,0x08,0x7f}, /* H */
-    {0x00,0x41,0x7f,0x41,0x00}, /* I */
-    {0x20,0x40,0x41,0x3f,0x01}, /* J */
-    {0x7f,0x08,0x14,0x22,0x41}, /* K */
-    {0x7f,0x40,0x40,0x40,0x40}, /* L */
-    {0x7f,0x02,0x0c,0x02,0x7f}, /* M */
-    {0x7f,0x04,0x08,0x10,0x7f}, /* N */
-    {0x3e,0x41,0x41,0x41,0x3e}, /* O */
-    {0x7f,0x09,0x09,0x09,0x06}, /* P */
-    {0x3e,0x41,0x51,0x21,0x5e}, /* Q */
-    {0x7f,0x09,0x19,0x29,0x46}, /* R */
-    {0x46,0x49,0x49,0x49,0x31}, /* S */
-    {0x01,0x01,0x7f,0x01,0x01}, /* T */
-    {0x3f,0x40,0x40,0x40,0x3f}, /* U */
-    {0x1f,0x20,0x40,0x20,0x1f}, /* V */
-    {0x3f,0x40,0x38,0x40,0x3f}, /* W */
-    {0x63,0x14,0x08,0x14,0x63}, /* X */
-    {0x07,0x08,0x70,0x08,0x07}, /* Y */
-    {0x61,0x51,0x49,0x45,0x43}, /* Z */
-    {0x00,0x7f,0x41,0x41,0x00}, /* [ */
-    {0x02,0x04,0x08,0x10,0x20}, /* \ */
-    {0x00,0x41,0x41,0x7f,0x00}, /* ] */
-    {0x04,0x02,0x01,0x02,0x04}, /* ^ */
-    {0x40,0x40,0x40,0x40,0x40}, /* _ */
-    {0x00,0x01,0x02,0x04,0x00}, /* ` */
-    {0x20,0x54,0x54,0x54,0x78}, /* a */
-    {0x7f,0x48,0x44,0x44,0x38}, /* b */
-    {0x38,0x44,0x44,0x44,0x20}, /* c */
-    {0x38,0x44,0x44,0x48,0x7f}, /* d */
-    {0x38,0x54,0x54,0x54,0x18}, /* e */
-    {0x08,0x7e,0x09,0x01,0x02}, /* f */
-    {0x0c,0x52,0x52,0x52,0x3e}, /* g */
-    {0x7f,0x08,0x04,0x04,0x78}, /* h */
-    {0x00,0x44,0x7d,0x40,0x00}, /* i */
-    {0x20,0x40,0x44,0x3d,0x00}, /* j */
-    {0x7f,0x10,0x28,0x44,0x00}, /* k */
-    {0x00,0x41,0x7f,0x40,0x00}, /* l */
-    {0x7c,0x04,0x18,0x04,0x78}, /* m */
-    {0x7c,0x08,0x04,0x04,0x78}, /* n */
-    {0x38,0x44,0x44,0x44,0x38}, /* o */
-    {0x7c,0x14,0x14,0x14,0x08}, /* p */
-    {0x08,0x14,0x14,0x18,0x7c}, /* q */
-    {0x7c,0x08,0x04,0x04,0x08}, /* r */
-    {0x48,0x54,0x54,0x54,0x20}, /* s */
-    {0x04,0x3f,0x44,0x40,0x20}, /* t */
-    {0x3c,0x40,0x40,0x20,0x7c}, /* u */
-    {0x1c,0x20,0x40,0x20,0x1c}, /* v */
-    {0x3c,0x40,0x30,0x40,0x3c}, /* w */
-    {0x44,0x28,0x10,0x28,0x44}, /* x */
-    {0x0c,0x50,0x50,0x50,0x3c}, /* y */
-    {0x44,0x64,0x54,0x4c,0x44}, /* z */
-    {0x00,0x08,0x36,0x41,0x00}, /* { */
-    {0x00,0x00,0x7f,0x00,0x00}, /* | */
-    {0x00,0x41,0x36,0x08,0x00}, /* } */
-    {0x10,0x08,0x08,0x10,0x08}, /* ~ */
-};
-
-/* ── Text drawing ──────────────────────────────────────────────── */
-
-static void fb_putchar(int x, int y, char c)
-{
-    uint8_t *fb = shelbourne_display_buffer(state.hw);
-    if (!fb) return;
-    if (c < 32 || c > 126) c = '?';
-    const uint8_t *glyph = font5x7[c - 32];
-    for (int col = 0; col < FONT_W; col++) {
-        uint8_t bits = glyph[col];
-        for (int row = 0; row < FONT_H; row++) {
-            int px = x + col, py = y + row;
-            if (px >= 0 && px < SHELBOURNE_FB_WIDTH &&
-                py >= 0 && py < SHELBOURNE_FB_HEIGHT)
-                fb[py * SHELBOURNE_FB_WIDTH + px] = (bits & (1 << row)) ? 0xFF : 0x00;
-        }
-    }
-}
-
-static void fb_putstr(int x, int y, const char *s)
-{
-    for (int i = 0; s[i] && x + CHAR_W <= SHELBOURNE_FB_WIDTH; i++) {
-        fb_putchar(x, y, s[i]);
-        x += CHAR_W;
-    }
-}
-
-/* 2x scaled text */
-static void fb_putchar_2x(int x, int y, char c)
-{
-    uint8_t *fb = shelbourne_display_buffer(state.hw);
-    if (!fb) return;
-    if (c < 32 || c > 126) c = '?';
-    const uint8_t *glyph = font5x7[c - 32];
-    for (int col = 0; col < FONT_W; col++) {
-        uint8_t bits = glyph[col];
-        for (int row = 0; row < FONT_H; row++) {
-            uint8_t val = (bits & (1 << row)) ? 0xFF : 0x00;
-            for (int dy = 0; dy < 2; dy++)
-                for (int dx = 0; dx < 2; dx++) {
-                    int px = x + col * 2 + dx, py = y + row * 2 + dy;
-                    if (px >= 0 && px < SHELBOURNE_FB_WIDTH &&
-                        py >= 0 && py < SHELBOURNE_FB_HEIGHT)
-                        fb[py * SHELBOURNE_FB_WIDTH + px] = val;
-                }
-        }
-    }
-}
-
-static void fb_putstr_2x(int x, int y, const char *s)
-{
-    for (int i = 0; s[i] && x + BIG_CHAR_W <= SHELBOURNE_FB_WIDTH; i++) {
-        fb_putchar_2x(x, y, s[i]);
-        x += BIG_CHAR_W;
-    }
-}
-
-static void fb_center_2x(int y, const char *s)
-{
-    int len = strlen(s);
-    if (len > BIG_COLS) len = BIG_COLS;
-    int x = (SHELBOURNE_FB_WIDTH - len * BIG_CHAR_W) / 2;
-    fb_putstr_2x(x, y, s);
-}
-
-/* 4x scaled font for clock */
-#define HUGE_CHAR_W 24
-#define HUGE_CHAR_H 32
-
-static void fb_putchar_4x(int x, int y, char c)
-{
-    uint8_t *fb = shelbourne_display_buffer(state.hw);
-    if (!fb) return;
-    if (c < 32 || c > 126) c = '?';
-    const uint8_t *glyph = font5x7[c - 32];
-    for (int col = 0; col < FONT_W; col++) {
-        uint8_t bits = glyph[col];
-        for (int row = 0; row < FONT_H; row++) {
-            uint8_t val = (bits & (1 << row)) ? 0xFF : 0x00;
-            for (int dy = 0; dy < 4; dy++)
-                for (int dx = 0; dx < 4; dx++) {
-                    int px = x + col * 4 + dx, py = y + row * 4 + dy;
-                    if (px >= 0 && px < SHELBOURNE_FB_WIDTH &&
-                        py >= 0 && py < SHELBOURNE_FB_HEIGHT)
-                        fb[py * SHELBOURNE_FB_WIDTH + px] = val;
-                }
-        }
-    }
-}
-
-static void fb_center_4x(int y, const char *s)
-{
-    int len = strlen(s);
-    int w = len * HUGE_CHAR_W;
-    int x = (SHELBOURNE_FB_WIDTH - w) / 2;
-    for (int i = 0; s[i]; i++) {
-        fb_putchar_4x(x, y, s[i]);
-        x += HUGE_CHAR_W;
-    }
-}
-
 /* ── Volume bar ────────────────────────────────────────────────── */
 
 static void draw_volume_bar(void)
@@ -454,7 +244,7 @@ static void draw_volume_bar(void)
     /* Volume number */
     char vol[4];
     snprintf(vol, sizeof(vol), "%d", state.volume);
-    fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(vol) * CHAR_W - 2, bar_y + 3, vol);
+    fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(vol) * SMALL_CHAR_W - 2, bar_y + 3, vol);
 }
 
 static int vol_bar_visible(void)
@@ -480,36 +270,6 @@ static const source_t *active_source(void)
     preset_t *p = &presets[state.active_preset];
     if (p->num_sources == 0) return NULL;
     return &p->sources[p->current];
-}
-
-static void display_logo(const uint8_t *logo)
-{
-    uint8_t *fb = shelbourne_display_buffer(state.hw);
-    if (fb && logo)
-        memcpy(fb, logo, SHELBOURNE_FB_SIZE);
-}
-
-/* Word-wrap text in 2x font across multiple lines starting at y.
-   Returns y position after last line drawn. */
-static int fb_wrap_2x(int y, int y_max, const char *text)
-{
-    while (*text && y + BIG_CHAR_H <= y_max) {
-        int len = strlen(text);
-        int line_chars = len < BIG_COLS ? len : BIG_COLS;
-        if (len > BIG_COLS) {
-            int brk = BIG_COLS;
-            while (brk > 0 && text[brk] != ' ') brk--;
-            if (brk > 0) line_chars = brk;
-        }
-        char line[BIG_COLS + 1];
-        memcpy(line, text, line_chars);
-        line[line_chars] = '\0';
-        fb_center_2x(y, line);
-        text += line_chars;
-        while (*text == ' ') text++;
-        y += BIG_CHAR_H + 2;
-    }
-    return y;
 }
 
 static void display_update(void)
@@ -557,7 +317,7 @@ static void display_update(void)
             char idx[16];
             snprintf(idx, sizeof(idx), "%d/%d",
                      state.current_track + 1, state.num_tracks);
-            fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(idx) * CHAR_W, 0, idx);
+            fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(idx) * SMALL_CHAR_W, 0, idx);
 
             /* Title in big font, word-wrapped */
             int y = fb_wrap_2x(12, 50, t->title);
@@ -572,7 +332,7 @@ static void display_update(void)
 
     } else {
         /* Idle — show clock */
-        time_t now = time(NULL);
+        time_t now = ntp_time();
         struct tm *tm = localtime(&now);
         if (tm) {
             char clk[6];
@@ -615,102 +375,6 @@ static int ends_with_ci(const char *s, const char *suffix)
         if (a != b) return 0;
     }
     return 1;
-}
-
-/* ── DNS resolver ──────────────────────────────────────────────── */
-
-static int dns_resolve(const char *hostname, struct in_addr *out)
-{
-    if (inet_aton(hostname, out))
-        return 0;
-
-    struct in_addr ns_addr;
-    inet_aton("192.168.2.1", &ns_addr);
-
-    FILE *rc = fopen("/etc/resolv.conf", "r");
-    if (rc) {
-        char line[256];
-        while (fgets(line, sizeof(line), rc)) {
-            char ip[64];
-            if (sscanf(line, "nameserver %63s", ip) == 1) {
-                inet_aton(ip, &ns_addr);
-                break;
-            }
-        }
-        fclose(rc);
-    }
-
-    uint8_t pkt[512];
-    memset(pkt, 0, sizeof(pkt));
-    pkt[0] = 0x12; pkt[1] = 0x34;
-    pkt[2] = 0x01; pkt[3] = 0x00;
-    pkt[4] = 0x00; pkt[5] = 0x01;
-    int off = 12;
-
-    const char *p = hostname;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        int len = dot ? (int)(dot - p) : (int)strlen(p);
-        if (off + 1 + len >= (int)sizeof(pkt) - 5) return -1;
-        pkt[off++] = len;
-        memcpy(pkt + off, p, len);
-        off += len;
-        p += len + (*p && dot ? 1 : 0);
-    }
-    pkt[off++] = 0;
-    pkt[off++] = 0; pkt[off++] = 1;
-    pkt[off++] = 0; pkt[off++] = 1;
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-
-    struct timeval tv = {.tv_sec = 3};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    struct sockaddr_in ns = {0};
-    ns.sin_family = AF_INET;
-    ns.sin_port = htons(53);
-    ns.sin_addr = ns_addr;
-
-    sendto(sock, pkt, off, 0, (struct sockaddr *)&ns, sizeof(ns));
-
-    uint8_t resp[512];
-    int rlen = recv(sock, resp, sizeof(resp), 0);
-    close(sock);
-    if (rlen < 12) return -1;
-
-    if (resp[0] != 0x12 || resp[1] != 0x34) return -1;
-    if (!(resp[2] & 0x80)) return -1;
-    if ((resp[3] & 0x0F) != 0) return -1;
-
-    int ancount = (resp[6] << 8) | resp[7];
-    if (ancount == 0) return -1;
-
-    int roff = 12;
-    while (roff < rlen && resp[roff] != 0) {
-        if ((resp[roff] & 0xC0) == 0xC0) { roff += 2; break; }
-        roff += 1 + resp[roff];
-    }
-    if (roff < rlen && resp[roff] == 0) roff++;
-    roff += 4;
-
-    for (int i = 0; i < ancount && roff < rlen; i++) {
-        while (roff < rlen) {
-            if ((resp[roff] & 0xC0) == 0xC0) { roff += 2; break; }
-            if (resp[roff] == 0) { roff++; break; }
-            roff += 1 + resp[roff];
-        }
-        if (roff + 10 > rlen) return -1;
-        uint16_t rtype = (resp[roff] << 8) | resp[roff+1];
-        uint16_t rdlen = (resp[roff+8] << 8) | resp[roff+9];
-        roff += 10;
-        if (rtype == 1 && rdlen == 4) {
-            memcpy(out, resp + roff, 4);
-            return 0;
-        }
-        roff += rdlen;
-    }
-    return -1;
 }
 
 /* ── ID3 tag reading ───────────────────────────────────────────── */
@@ -903,7 +567,7 @@ static void keypad_poll(void)
 
         switch (events[i].key) {
         case SHELBOURNE_KEY_POWER:
-            state.cmd_pause = 1;
+            state.cmd_off = 1;
             break;
         case SHELBOURNE_KEY_VOLUME_UP:
             if (state.volume < 100) {
@@ -950,7 +614,7 @@ static void keypad_poll(void)
 /* ── Interrupt check macro ─────────────────────────────────────── */
 
 #define INTERRUPTED() \
-    (state.cmd_quit || state.cmd_aux || state.cmd_preset >= 0)
+    (state.cmd_quit || state.cmd_off || state.cmd_aux || state.cmd_preset >= 0)
 
 /* ── Radio streaming ───────────────────────────────────────────── */
 
@@ -1048,7 +712,7 @@ static int radio_connect(const source_t *src)
         } else {
             /* Absolute redirect — parse host/port/path */
             if (strncmp(loc, "http://", 7) == 0) { loc += 7; port = 80; }
-            else if (strncmp(loc, "https://", 8) == 0) { loc += 8; port = 443; }
+            else if (strncmp(loc, "https://", 8) == 0) { loc += 8; port = 80; }
             else port = 80;
 
             char *slash = strchr(loc, '/');
@@ -1096,11 +760,6 @@ static void parse_icy_metadata(const char *meta, int meta_len)
     state.display_dirty = 1;
 }
 
-/*
- * Blocking read of exactly `len` bytes. Used for ICY metadata which is
- * tiny (1-257 bytes) and immediately follows audio data in the TCP stream.
- * Temporarily clears O_NONBLOCK if needed.
- */
 static int recv_exact(int fd, void *buf, int len)
 {
     int flags = fcntl(fd, F_GETFL);
@@ -1123,11 +782,6 @@ static int recv_exact(int fd, void *buf, int len)
     return got;
 }
 
-/*
- * Read from stream socket, stripping ICY metadata blocks.
- * Returns bytes of audio data written to buf, or <=0 on error/EOF.
- * Safe with both blocking and non-blocking sockets.
- */
 static int icy_recv(int fd, uint8_t *buf, int maxlen)
 {
     if (state.icy_metaint == 0)
@@ -1145,7 +799,7 @@ static int icy_recv(int fd, uint8_t *buf, int maxlen)
     if (state.icy_remaining == 0) {
         uint8_t mlen_byte;
         if (recv_exact(fd, &mlen_byte, 1) < 0)
-            return n;  /* return audio we got; metadata read fails next time */
+            return n;
 
         int meta_len = mlen_byte * 16;
         if (meta_len > 0) {
@@ -1169,7 +823,7 @@ static void play_radio(const source_t *src)
     uint8_t stream_buf[MP3_BUF_SIZE * 2];
     int buf_fill = 0;
 
-    while (!state.cmd_quit && !state.cmd_aux && state.cmd_preset < 0) {
+    while (!INTERRUPTED()) {
         /* Show logo + name immediately (before slow connect) */
         printf("Connecting to %s...\n", src->name);
         state.stream_title[0] = '\0';
@@ -1210,28 +864,6 @@ static void play_radio(const source_t *src)
         while (!INTERRUPTED()) {
             keypad_poll();
 
-            /* Handle pause */
-            while (state.cmd_pause && !INTERRUPTED()) {
-                state.cmd_pause = 0;
-                state.playing = 0;
-                display_update();
-                while (!state.cmd_pause && !INTERRUPTED()) {
-                    usleep(50000);
-                    keypad_poll();
-                    if (state.display_dirty) {
-                        state.display_dirty = 0;
-                        display_update();
-                    }
-                }
-                if (state.cmd_pause) {
-                    state.cmd_pause = 0;
-                    state.playing = 1;
-                    audio_reset();
-                    display_update();
-                }
-            }
-            if (INTERRUPTED()) break;
-
             /* Top up buffer */
             if (buf_fill < (int)sizeof(stream_buf)) {
                 int n = icy_recv(sock, stream_buf + buf_fill,
@@ -1251,7 +883,7 @@ static void play_radio(const source_t *src)
             mp3dec_frame_info_t info;
             mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
-            while (buf_fill >= 4 && !INTERRUPTED() && !state.cmd_pause) {
+            while (buf_fill >= 4 && !INTERRUPTED()) {
                 int samples = mp3dec_decode_frame(&mp3d,
                     stream_buf, buf_fill, pcm, &info);
 
@@ -1320,28 +952,6 @@ static void play_usb(const source_t *src)
         int buf_fill = 0;
 
         while (!INTERRUPTED()) {
-            /* Handle pause */
-            while (state.cmd_pause && !INTERRUPTED()) {
-                state.cmd_pause = 0;
-                state.playing = 0;
-                display_update();
-                while (!state.cmd_pause && !INTERRUPTED()) {
-                    usleep(50000);
-                    keypad_poll();
-                    if (state.display_dirty) {
-                        state.display_dirty = 0;
-                        display_update();
-                    }
-                }
-                if (state.cmd_pause) {
-                    state.cmd_pause = 0;
-                    state.playing = 1;
-                    audio_reset();
-                    display_update();
-                }
-            }
-            if (INTERRUPTED()) break;
-
             /* Refill buffer */
             if (buf_fill < MP3_BUF_SIZE) {
                 int n = fread(file_buf + buf_fill, 1,
@@ -1411,20 +1021,12 @@ static void play_aux(void)
     state.playing = 1;
     display_update();
 
-    while (!state.cmd_quit && state.cmd_preset < 0) {
+    while (!state.cmd_quit && state.cmd_preset < 0 && !state.cmd_off) {
         if (shelbourne_aux_pump(state.hw, state.vol_gain) < 0) {
             fprintf(stderr, "AUX pump error\n");
             break;
         }
         keypad_poll();
-
-        if (state.cmd_pause) {
-            state.cmd_pause = 0;
-            static int aux_muted = 0;
-            aux_muted = !aux_muted;
-            shelbourne_mute(state.hw, aux_muted);
-            printf("AUX %s\n", aux_muted ? "muted" : "unmuted");
-        }
 
         if (state.display_dirty) {
             state.display_dirty = 0;
@@ -1443,231 +1045,117 @@ static void play_aux(void)
 /* ── Podcast ───────────────────────────────────────────────────── */
 
 /*
- * Fetch RSS feed via HTTP GET, find the first <enclosure url="..."/>
- * and <pubDate>...</pubDate> in the first <item>.
+ * Fetch RSS feed via curl (HTTPS required), find the first
+ * <enclosure url="..."/> and <pubDate>...</pubDate> in the first <item>.
  */
 static int podcast_fetch_latest(const source_t *src)
 {
-    /* Connect to feed host on port 80 */
-    struct in_addr addr;
-    if (dns_resolve(src->feed_url, &addr) < 0) {
-        /* feed_url is "host/path" — extract host */
-        char host[256];
-        const char *slash = strchr(src->feed_url, '/');
-        if (!slash) {
-            fprintf(stderr, "Bad feed URL: %s\n", src->feed_url);
-            return -1;
-        }
-        int hlen = slash - src->feed_url;
-        if (hlen >= (int)sizeof(host)) hlen = sizeof(host) - 1;
-        memcpy(host, src->feed_url, hlen);
-        host[hlen] = '\0';
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "curl -skL 'https://%s' 2>/dev/null",
+             src->feed_url);
 
-        if (dns_resolve(host, &addr) < 0) {
-            fprintf(stderr, "DNS failed for %s\n", host);
-            return -1;
-        }
-
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return -1;
-
-        struct timeval tv = {.tv_sec = 10};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        struct sockaddr_in sa = {0};
-        sa.sin_family = AF_INET;
-        sa.sin_port = htons(80);
-        sa.sin_addr = addr;
-
-        if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-            close(fd);
-            fprintf(stderr, "Feed connect failed: %s\n", strerror(errno));
-            return -1;
-        }
-
-        char req[1024];
-        int len = snprintf(req, sizeof(req),
-            "GET /%s HTTP/1.0\r\n"
-            "Host: %s\r\n"
-            "User-Agent: ShelbournePlayer/1.0\r\n"
-            "Accept: */*\r\n"
-            "\r\n",
-            slash + 1, host);
-        send(fd, req, len, 0);
-
-        /* Read entire response (RSS feeds are typically <100KB) */
-        char *rss = malloc(128 * 1024);
-        if (!rss) { close(fd); return -1; }
-        int rss_len = 0;
-        while (rss_len < 128 * 1024 - 1) {
-            int n = recv(fd, rss + rss_len, 128 * 1024 - 1 - rss_len, 0);
-            if (n <= 0) break;
-            rss_len += n;
-        }
-        rss[rss_len] = '\0';
-        close(fd);
-
-        /* Skip HTTP headers */
-        char *body = strstr(rss, "\r\n\r\n");
-        if (!body) { free(rss); return -1; }
-        body += 4;
-
-        /* Find first <item> */
-        char *item = strstr(body, "<item");
-        if (!item) { free(rss); return -1; }
-
-        /* Find <enclosure url="..." */
-        char *enc = strstr(item, "<enclosure");
-        if (!enc) { free(rss); return -1; }
-        char *url_attr = strstr(enc, "url=\"");
-        if (!url_attr) { free(rss); return -1; }
-        url_attr += 5;
-        char *url_end = strchr(url_attr, '"');
-        if (!url_end) { free(rss); return -1; }
-
-        int url_len = url_end - url_attr;
-        if (url_len >= (int)sizeof(state.podcast_ep_url))
-            url_len = sizeof(state.podcast_ep_url) - 1;
-        memcpy(state.podcast_ep_url, url_attr, url_len);
-        state.podcast_ep_url[url_len] = '\0';
-
-        /* Parse URL into host/port/path */
-        char *ep = state.podcast_ep_url;
-        state.podcast_ep_port = 80;
-        if (strncmp(ep, "http://", 7) == 0) ep += 7;
-        else if (strncmp(ep, "https://", 8) == 0) { ep += 8; state.podcast_ep_port = 80; }
-
-        char *ep_slash = strchr(ep, '/');
-        if (ep_slash) {
-            strncpy(state.podcast_ep_path, ep_slash, sizeof(state.podcast_ep_path) - 1);
-            int hn = ep_slash - ep;
-            if (hn >= (int)sizeof(state.podcast_ep_host))
-                hn = sizeof(state.podcast_ep_host) - 1;
-            memcpy(state.podcast_ep_host, ep, hn);
-            state.podcast_ep_host[hn] = '\0';
-        }
-
-        /* Extract port from host if present */
-        char *colon = strchr(state.podcast_ep_host, ':');
-        if (colon) {
-            state.podcast_ep_port = atoi(colon + 1);
-            *colon = '\0';
-        }
-
-        /* Find <pubDate> within the <item> */
-        state.podcast_date[0] = '\0';
-        char *pub = strstr(item, "<pubDate>");
-        if (pub) {
-            pub += 9;
-            char *pub_end = strstr(pub, "</pubDate>");
-            if (pub_end) {
-                /* Extract "Mon, 13 Mar 2026" from RFC 2822 date */
-                /* Skip day-of-week prefix like "Thu, " */
-                char *comma = strchr(pub, ',');
-                if (comma && comma < pub_end) pub = comma + 2;
-                int plen = pub_end - pub;
-                /* Take just "13 Mar 2026" (first ~11 chars) */
-                if (plen > 11) plen = 11;
-                if (plen >= (int)sizeof(state.podcast_date))
-                    plen = sizeof(state.podcast_date) - 1;
-                memcpy(state.podcast_date, pub, plen);
-                state.podcast_date[plen] = '\0';
-                /* Trim trailing spaces */
-                while (plen > 0 && state.podcast_date[plen-1] == ' ')
-                    state.podcast_date[--plen] = '\0';
-            }
-        }
-
-        printf("Podcast episode: %s\n", state.podcast_ep_url);
-        printf("Podcast date: %s\n", state.podcast_date);
-        free(rss);
-        return 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to run curl for podcast feed\n");
+        return -1;
     }
-    return -1;
+
+    char *rss = malloc(128 * 1024);
+    if (!rss) { pclose(fp); return -1; }
+
+    int rss_len = 0;
+    while (rss_len < 128 * 1024 - 1) {
+        int n = fread(rss + rss_len, 1, 128 * 1024 - 1 - rss_len, fp);
+        if (n <= 0) break;
+        rss_len += n;
+    }
+    rss[rss_len] = '\0';
+    pclose(fp);
+
+    if (rss_len == 0) {
+        fprintf(stderr, "Empty response from podcast feed\n");
+        free(rss);
+        return -1;
+    }
+
+    /* Find first <item> */
+    char *item = strstr(rss, "<item");
+    if (!item) { free(rss); return -1; }
+
+    /* Find <enclosure url="..." */
+    char *enc = strstr(item, "<enclosure");
+    if (!enc) { free(rss); return -1; }
+    char *url_attr = strstr(enc, "url=\"");
+    if (!url_attr) { free(rss); return -1; }
+    url_attr += 5;
+    char *url_end = strchr(url_attr, '"');
+    if (!url_end) { free(rss); return -1; }
+
+    int url_len = url_end - url_attr;
+    if (url_len >= (int)sizeof(state.podcast_ep_url))
+        url_len = sizeof(state.podcast_ep_url) - 1;
+    memcpy(state.podcast_ep_url, url_attr, url_len);
+    state.podcast_ep_url[url_len] = '\0';
+
+    /* Parse URL into host/port/path */
+    char *ep = state.podcast_ep_url;
+    state.podcast_ep_port = 80;
+    if (strncmp(ep, "http://", 7) == 0) ep += 7;
+    else if (strncmp(ep, "https://", 8) == 0) { ep += 8; state.podcast_ep_port = 80; }
+
+    char *ep_slash = strchr(ep, '/');
+    if (ep_slash) {
+        strncpy(state.podcast_ep_path, ep_slash, sizeof(state.podcast_ep_path) - 1);
+        state.podcast_ep_path[sizeof(state.podcast_ep_path) - 1] = '\0';
+        int hn = ep_slash - ep;
+        if (hn >= (int)sizeof(state.podcast_ep_host))
+            hn = sizeof(state.podcast_ep_host) - 1;
+        memcpy(state.podcast_ep_host, ep, hn);
+        state.podcast_ep_host[hn] = '\0';
+    }
+
+    /* Extract port from host if present */
+    char *colon = strchr(state.podcast_ep_host, ':');
+    if (colon) {
+        state.podcast_ep_port = atoi(colon + 1);
+        *colon = '\0';
+    }
+
+    /* Find <pubDate> within the <item> */
+    state.podcast_date[0] = '\0';
+    char *pub = strstr(item, "<pubDate>");
+    if (pub) {
+        pub += 9;
+        char *pub_end = strstr(pub, "</pubDate>");
+        if (pub_end) {
+            /* Extract "13 Mar 2026" from RFC 2822 date */
+            char *comma = strchr(pub, ',');
+            if (comma && comma < pub_end) pub = comma + 2;
+            int plen = pub_end - pub;
+            if (plen > 11) plen = 11;
+            if (plen >= (int)sizeof(state.podcast_date))
+                plen = sizeof(state.podcast_date) - 1;
+            memcpy(state.podcast_date, pub, plen);
+            state.podcast_date[plen] = '\0';
+            while (plen > 0 && state.podcast_date[plen-1] == ' ')
+                state.podcast_date[--plen] = '\0';
+        }
+    }
+
+    printf("Podcast episode: %s\n", state.podcast_ep_url);
+    printf("Podcast date: %s\n", state.podcast_date);
+    free(rss);
+    return 0;
 }
 
 static int podcast_connect(void)
 {
-    struct in_addr addr;
-    if (dns_resolve(state.podcast_ep_host, &addr) < 0) {
-        fprintf(stderr, "DNS failed for %s\n", state.podcast_ep_host);
-        return -1;
-    }
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    struct timeval tv = {.tv_sec = 10};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    struct sockaddr_in sa = {0};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(state.podcast_ep_port);
-    sa.sin_addr = addr;
-
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        fprintf(stderr, "Podcast connect failed: %s\n", strerror(errno));
-        return -1;
-    }
-
-    char req[1024];
-    int len = snprintf(req, sizeof(req),
-        "GET %s HTTP/1.0\r\n"
-        "Host: %s\r\n"
-        "User-Agent: ShelbournePlayer/1.0\r\n"
-        "Accept: */*\r\n"
-        "\r\n",
-        state.podcast_ep_path, state.podcast_ep_host);
-    if (send(fd, req, len, 0) != len) { close(fd); return -1; }
-
-    /* Read headers, follow redirects */
-    char hdr[4096];
-    int hlen = 0;
-    while (hlen < (int)sizeof(hdr) - 1) {
-        char c;
-        if (recv(fd, &c, 1, 0) != 1) break;
-        hdr[hlen++] = c;
-        if (hlen >= 4 && hdr[hlen-4]=='\r' && hdr[hlen-3]=='\n' &&
-            hdr[hlen-2]=='\r' && hdr[hlen-1]=='\n') break;
-    }
-    hdr[hlen] = '\0';
-
-    if (strstr(hdr, " 301") || strstr(hdr, " 302")) {
-        char *loc = strstr(hdr, "Location: ");
-        if (!loc) loc = strstr(hdr, "location: ");
-        if (loc) {
-            loc += 10;
-            char *end = strstr(loc, "\r\n");
-            if (end) *end = '\0';
-            printf("Podcast redirect: %s\n", loc);
-            close(fd);
-
-            /* Parse redirect URL */
-            char *p = loc;
-            state.podcast_ep_port = 80;
-            if (strncmp(p, "http://", 7) == 0) p += 7;
-            else if (strncmp(p, "https://", 8) == 0) p += 8;
-
-            char *sl = strchr(p, '/');
-            if (sl) {
-                strncpy(state.podcast_ep_path, sl, sizeof(state.podcast_ep_path) - 1);
-                int hn = sl - p;
-                if (hn >= (int)sizeof(state.podcast_ep_host))
-                    hn = sizeof(state.podcast_ep_host) - 1;
-                memcpy(state.podcast_ep_host, p, hn);
-                state.podcast_ep_host[hn] = '\0';
-            }
-            char *col = strchr(state.podcast_ep_host, ':');
-            if (col) { state.podcast_ep_port = atoi(col+1); *col = '\0'; }
-
-            return podcast_connect();  /* one level of redirect */
-        }
-    }
-
-    printf("Podcast stream ready\n");
+    int fd = http_get(state.podcast_ep_host, state.podcast_ep_port,
+                      state.podcast_ep_path);
+    if (fd < 0)
+        fprintf(stderr, "Podcast connect failed\n");
+    else
+        printf("Podcast stream ready\n");
     return fd;
 }
 
@@ -1730,28 +1218,6 @@ static void play_podcast(const source_t *src)
     while (!INTERRUPTED()) {
         keypad_poll();
 
-        /* Handle pause */
-        while (state.cmd_pause && !INTERRUPTED()) {
-            state.cmd_pause = 0;
-            state.playing = 0;
-            display_update();
-            while (!state.cmd_pause && !INTERRUPTED()) {
-                usleep(50000);
-                keypad_poll();
-                if (state.display_dirty) {
-                    state.display_dirty = 0;
-                    display_update();
-                }
-            }
-            if (state.cmd_pause) {
-                state.cmd_pause = 0;
-                state.playing = 1;
-                audio_reset();
-                display_update();
-            }
-        }
-        if (INTERRUPTED()) break;
-
         /* Top up buffer */
         if (!stream_ended && buf_fill < (int)sizeof(stream_buf)) {
             int n = recv(sock, stream_buf + buf_fill,
@@ -1770,7 +1236,7 @@ static void play_podcast(const source_t *src)
         mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
         int decoded_any = 0;
-        while (buf_fill >= 4 && !INTERRUPTED() && !state.cmd_pause) {
+        while (buf_fill >= 4 && !INTERRUPTED()) {
             int samples = mp3dec_decode_frame(&mp3d,
                 stream_buf, buf_fill, pcm, &info);
 
@@ -1837,6 +1303,8 @@ int main(int argc, char *argv[])
 
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    setenv("TZ", "US/Eastern", 1);
+    tzset();
 
     memset(&state, 0, sizeof(state));
     state.active_preset = NUM_PRESETS;  /* idle — no source selected */
@@ -1856,6 +1324,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Hardware init failed\n");
         return 1;
     }
+
+    /* Initialize display module */
+    display_init(state.hw);
 
     /* LED always off */
     shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
@@ -1877,9 +1348,9 @@ int main(int argc, char *argv[])
         } else if (src && src->type == SRC_DIR) {
             play_usb(src);
         } else {
-            /* Idle — show clock, update every minute */
+            /* Idle — show clock */
             display_update();
-            while (!INTERRUPTED() && !state.cmd_aux) {
+            while (!INTERRUPTED()) {
                 usleep(100000);
                 keypad_poll();
                 /* Refresh clock every ~10s */
@@ -1895,14 +1366,14 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* Handle AUX */
-        if (state.cmd_aux) {
+        /* Handle commands in priority order */
+        if (state.cmd_off) {
+            state.cmd_off = 0;
+            state.active_preset = NUM_PRESETS;  /* idle */
+        } else if (state.cmd_aux) {
             state.cmd_aux = 0;
             state.active_preset = -1;
-        }
-
-        /* Handle preset */
-        if (state.cmd_preset >= 0) {
+        } else if (state.cmd_preset >= 0) {
             int p = state.cmd_preset;
             state.cmd_preset = -1;
 
