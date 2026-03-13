@@ -42,7 +42,7 @@
 
 /* ── Source model ──────────────────────────────────────────────── */
 
-enum source_type { SRC_RADIO, SRC_DIR };
+enum source_type { SRC_RADIO, SRC_DIR, SRC_PODCAST };
 
 typedef struct {
     enum source_type type;
@@ -51,6 +51,7 @@ typedef struct {
     int         port;
     const char *path;
     const char *dir;
+    const char *feed_url;   /* RSS feed URL for podcasts */
     const uint8_t *logo;
 } source_t;
 
@@ -82,6 +83,11 @@ static const source_t p4_sources[] = {
     { SRC_DIR, "USB Music", .dir = "/media/sda1", .logo = logo_usb },
 };
 
+/* Preset 6: Weather podcast */
+static const source_t p6_sources[] = {
+    { SRC_PODCAST, "Eye on Sky", .feed_url = "podcasts.vpr.net/eye-on-the-sky", .logo = logo_eots },
+};
+
 typedef struct {
     const source_t *sources;
     int num_sources;
@@ -94,7 +100,7 @@ static preset_t presets[NUM_PRESETS] = {
     { p3_sources, sizeof(p3_sources)/sizeof(p3_sources[0]), 0 },
     { p4_sources, sizeof(p4_sources)/sizeof(p4_sources[0]), 0 },
     { NULL, 0, 0 },
-    { NULL, 0, 0 },
+    { p6_sources, sizeof(p6_sources)/sizeof(p6_sources[0]), 0 },
 };
 
 /* ── Track info ────────────────────────────────────────────────── */
@@ -125,6 +131,13 @@ static struct {
     int icy_remaining;       /* bytes until next metadata block */
     char stream_title[256];  /* current ICY StreamTitle */
 
+    /* Podcast */
+    char podcast_ep_url[512];    /* resolved episode MP3 URL */
+    char podcast_ep_host[256];   /* host for HTTP connection */
+    char podcast_ep_path[512];   /* path for HTTP GET */
+    int  podcast_ep_port;
+    char podcast_date[32];       /* episode date string */
+
     /* Audio */
     int playing;
 
@@ -142,8 +155,6 @@ static struct {
 
     /* Display */
     int display_dirty;
-    struct timespec logo_shown_at;  /* when logo was first displayed */
-    int logo_expired;               /* set once after 5s logo timeout */
 } state;
 
 /* ── Resampler ─────────────────────────────────────────────────── */
@@ -204,8 +215,6 @@ static int convert_and_write(const mp3d_sample_t *pcm,
 #define FONT_W 5
 #define FONT_H 7
 #define CHAR_W 6
-#define CHAR_H 8
-#define DISP_COLS (SHELBOURNE_FB_WIDTH / CHAR_W)
 
 /* 2x scaled font metrics */
 #define BIG_CHAR_W 12
@@ -337,14 +346,6 @@ static void fb_putstr(int x, int y, const char *s)
     }
 }
 
-static void fb_center(int y, const char *s)
-{
-    int len = strlen(s);
-    if (len > DISP_COLS) len = DISP_COLS;
-    int x = (SHELBOURNE_FB_WIDTH - len * CHAR_W) / 2;
-    fb_putstr(x, y, s);
-}
-
 /* 2x scaled text */
 static void fb_putchar_2x(int x, int y, char c)
 {
@@ -381,6 +382,42 @@ static void fb_center_2x(int y, const char *s)
     if (len > BIG_COLS) len = BIG_COLS;
     int x = (SHELBOURNE_FB_WIDTH - len * BIG_CHAR_W) / 2;
     fb_putstr_2x(x, y, s);
+}
+
+/* 4x scaled font for clock */
+#define HUGE_CHAR_W 24
+#define HUGE_CHAR_H 32
+
+static void fb_putchar_4x(int x, int y, char c)
+{
+    uint8_t *fb = shelbourne_display_buffer(state.hw);
+    if (!fb) return;
+    if (c < 32 || c > 126) c = '?';
+    const uint8_t *glyph = font5x7[c - 32];
+    for (int col = 0; col < FONT_W; col++) {
+        uint8_t bits = glyph[col];
+        for (int row = 0; row < FONT_H; row++) {
+            uint8_t val = (bits & (1 << row)) ? 0xFF : 0x00;
+            for (int dy = 0; dy < 4; dy++)
+                for (int dx = 0; dx < 4; dx++) {
+                    int px = x + col * 4 + dx, py = y + row * 4 + dy;
+                    if (px >= 0 && px < SHELBOURNE_FB_WIDTH &&
+                        py >= 0 && py < SHELBOURNE_FB_HEIGHT)
+                        fb[py * SHELBOURNE_FB_WIDTH + px] = val;
+                }
+        }
+    }
+}
+
+static void fb_center_4x(int y, const char *s)
+{
+    int len = strlen(s);
+    int w = len * HUGE_CHAR_W;
+    int x = (SHELBOURNE_FB_WIDTH - w) / 2;
+    for (int i = 0; s[i]; i++) {
+        fb_putchar_4x(x, y, s[i]);
+        x += HUGE_CHAR_W;
+    }
 }
 
 /* ── Volume bar ────────────────────────────────────────────────── */
@@ -452,6 +489,29 @@ static void display_logo(const uint8_t *logo)
         memcpy(fb, logo, SHELBOURNE_FB_SIZE);
 }
 
+/* Word-wrap text in 2x font across multiple lines starting at y.
+   Returns y position after last line drawn. */
+static int fb_wrap_2x(int y, int y_max, const char *text)
+{
+    while (*text && y + BIG_CHAR_H <= y_max) {
+        int len = strlen(text);
+        int line_chars = len < BIG_COLS ? len : BIG_COLS;
+        if (len > BIG_COLS) {
+            int brk = BIG_COLS;
+            while (brk > 0 && text[brk] != ' ') brk--;
+            if (brk > 0) line_chars = brk;
+        }
+        char line[BIG_COLS + 1];
+        memcpy(line, text, line_chars);
+        line[line_chars] = '\0';
+        fb_center_2x(y, line);
+        text += line_chars;
+        while (*text == ' ') text++;
+        y += BIG_CHAR_H + 2;
+    }
+    return y;
+}
+
 static void display_update(void)
 {
     shelbourne_display_clear(state.hw);
@@ -461,84 +521,71 @@ static void display_update(void)
         /* AUX mode — full-screen logo */
         display_logo(logo_aux);
 
-    } else if (src && src->type == SRC_RADIO) {
-        /* Radio mode — blank when paused, logo for first 5s, then metadata */
+    } else if (src && (src->type == SRC_RADIO || src->type == SRC_PODCAST)) {
+        /* Radio/podcast — half-height logo + text below */
         if (!state.playing) {
-            /* Paused/stopped — blank screen (already cleared above) */
-        } else {
-            int show_meta = 0;
-            if (state.stream_title[0]) {
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                long ms = (now.tv_sec - state.logo_shown_at.tv_sec) * 1000L +
-                          (now.tv_nsec - state.logo_shown_at.tv_nsec) / 1000000;
-                if (ms >= 5000) show_meta = 1;
-            }
-
-            if (show_meta) {
-                /* Station name at top in big font */
-                fb_center_2x(2, src->name);
-
-                /* Stream title — word-wrap across up to 4 lines */
-                const char *title = state.stream_title;
-                int y = 28;
-                while (*title && y < 80) {
-                    int len = strlen(title);
-                    int line_chars = len < DISP_COLS ? len : DISP_COLS;
-                    /* Break at last space within line width */
-                    if (len > DISP_COLS) {
-                        int brk = DISP_COLS;
-                        while (brk > 0 && title[brk] != ' ') brk--;
-                        if (brk > 0) line_chars = brk;
-                    }
-                    char line[DISP_COLS + 1];
-                    memcpy(line, title, line_chars);
-                    line[line_chars] = '\0';
-                    fb_center(y, line);
-                    title += line_chars;
-                    while (*title == ' ') title++;
-                    y += CHAR_H + 2;
-                }
-            } else if (src->logo) {
+            /* Not playing yet — show logo + name (for "connecting" phase) */
+            if (src->logo)
                 display_logo(src->logo);
-            } else {
-                fb_center_2x(18, src->name);
-            }
+            fb_center_2x(54, src->name);
+        } else if (src->type == SRC_PODCAST) {
+            /* Podcast — logo + name + date */
+            if (src->logo)
+                display_logo(src->logo);
+            fb_center_2x(54, src->name);
+            if (state.podcast_date[0])
+                fb_center_2x(74, state.podcast_date);
+        } else if (state.stream_title[0]) {
+            /* Radio with ICY metadata — logo + title */
+            if (src->logo)
+                display_logo(src->logo);
+            fb_wrap_2x(54, SHELBOURNE_FB_HEIGHT - 16, state.stream_title);
+        } else {
+            /* Radio, no metadata yet — logo + name */
+            if (src->logo)
+                display_logo(src->logo);
+            fb_center_2x(54, src->name);
         }
 
     } else if (src && src->type == SRC_DIR) {
-        /* USB mode — blank when paused */
+        /* USB mode */
         if (!state.playing) {
-            /* Paused — blank screen (already cleared above) */
+            /* Paused */
         } else if (state.num_tracks > 0) {
-            char hdr[8];
-            snprintf(hdr, sizeof(hdr), "P%d", state.active_preset + 1);
-            fb_putstr(0, 2, hdr);
-
-            char idx[12];
-            snprintf(idx, sizeof(idx), "%d/%d",
-                     state.current_track + 1, state.num_tracks);
-            fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(idx) * CHAR_W, 2, idx);
-
             track_t *t = &state.tracks[state.current_track];
 
-            /* Title in big font (truncate to 10 chars) */
-            char title[BIG_COLS + 1];
-            snprintf(title, sizeof(title), "%.*s", BIG_COLS, t->title);
-            fb_center_2x(18, title);
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%d/%d",
+                     state.current_track + 1, state.num_tracks);
+            fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(idx) * CHAR_W, 0, idx);
 
-            if (t->artist[0]) {
-                char line[DISP_COLS + 1];
-                snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->artist);
-                fb_center(40, line);
-            }
-            if (t->album[0]) {
-                char line[DISP_COLS + 1];
-                snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->album);
-                fb_center(50, line);
-            }
+            /* Title in big font, word-wrapped */
+            int y = fb_wrap_2x(12, 50, t->title);
+
+            if (t->artist[0])
+                y = fb_wrap_2x(y + 2, 80, t->artist);
+            if (t->album[0])
+                fb_wrap_2x(y + 2, 96, t->album);
         } else {
             fb_center_2x(18, "No tracks");
+        }
+
+    } else {
+        /* Idle — show clock */
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        if (tm) {
+            char clk[6];
+            snprintf(clk, sizeof(clk), "%d:%02d", tm->tm_hour, tm->tm_min);
+            fb_center_4x(20, clk);
+
+            const char *days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+            const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
+            char date[20];
+            snprintf(date, sizeof(date), "%s %s %d",
+                     days[tm->tm_wday], months[tm->tm_mon], tm->tm_mday);
+            fb_center_2x(62, date);
         }
     }
 
@@ -1123,7 +1170,9 @@ static void play_radio(const source_t *src)
     int buf_fill = 0;
 
     while (!state.cmd_quit && !state.cmd_aux && state.cmd_preset < 0) {
+        /* Show logo + name immediately (before slow connect) */
         printf("Connecting to %s...\n", src->name);
+        state.stream_title[0] = '\0';
         display_update();
 
         int sock = radio_connect(src);
@@ -1138,12 +1187,10 @@ static void play_radio(const source_t *src)
 
         audio_reset();
         state.radio_fd = sock;
-        state.stream_title[0] = '\0';
         buf_fill = 0;
 
         /* Pre-buffer */
         printf("Buffering...\n");
-        display_update();
         {
             struct timeval tv_buf = {.tv_sec = 5};
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_buf, sizeof(tv_buf));
@@ -1158,8 +1205,6 @@ static void play_radio(const source_t *src)
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
 
         state.playing = 1;
-        state.logo_expired = 0;
-        clock_gettime(CLOCK_MONOTONIC, &state.logo_shown_at);
         display_update();
 
         while (!INTERRUPTED()) {
@@ -1226,18 +1271,6 @@ static void play_radio(const source_t *src)
                     }
 
                     keypad_poll();
-
-                    /* Trigger display refresh when logo timeout expires */
-                    if (!state.logo_expired && state.stream_title[0]) {
-                        struct timespec now;
-                        clock_gettime(CLOCK_MONOTONIC, &now);
-                        long ms = (now.tv_sec - state.logo_shown_at.tv_sec) * 1000L +
-                                  (now.tv_nsec - state.logo_shown_at.tv_nsec) / 1000000;
-                        if (ms >= 5000) {
-                            state.logo_expired = 1;
-                            state.display_dirty = 1;
-                        }
-                    }
 
                     if (state.display_dirty) {
                         state.display_dirty = 0;
@@ -1407,6 +1440,387 @@ static void play_aux(void)
     printf("Left AUX mode\n");
 }
 
+/* ── Podcast ───────────────────────────────────────────────────── */
+
+/*
+ * Fetch RSS feed via HTTP GET, find the first <enclosure url="..."/>
+ * and <pubDate>...</pubDate> in the first <item>.
+ */
+static int podcast_fetch_latest(const source_t *src)
+{
+    /* Connect to feed host on port 80 */
+    struct in_addr addr;
+    if (dns_resolve(src->feed_url, &addr) < 0) {
+        /* feed_url is "host/path" — extract host */
+        char host[256];
+        const char *slash = strchr(src->feed_url, '/');
+        if (!slash) {
+            fprintf(stderr, "Bad feed URL: %s\n", src->feed_url);
+            return -1;
+        }
+        int hlen = slash - src->feed_url;
+        if (hlen >= (int)sizeof(host)) hlen = sizeof(host) - 1;
+        memcpy(host, src->feed_url, hlen);
+        host[hlen] = '\0';
+
+        if (dns_resolve(host, &addr) < 0) {
+            fprintf(stderr, "DNS failed for %s\n", host);
+            return -1;
+        }
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+
+        struct timeval tv = {.tv_sec = 10};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in sa = {0};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(80);
+        sa.sin_addr = addr;
+
+        if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            close(fd);
+            fprintf(stderr, "Feed connect failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        char req[1024];
+        int len = snprintf(req, sizeof(req),
+            "GET /%s HTTP/1.0\r\n"
+            "Host: %s\r\n"
+            "User-Agent: ShelbournePlayer/1.0\r\n"
+            "Accept: */*\r\n"
+            "\r\n",
+            slash + 1, host);
+        send(fd, req, len, 0);
+
+        /* Read entire response (RSS feeds are typically <100KB) */
+        char *rss = malloc(128 * 1024);
+        if (!rss) { close(fd); return -1; }
+        int rss_len = 0;
+        while (rss_len < 128 * 1024 - 1) {
+            int n = recv(fd, rss + rss_len, 128 * 1024 - 1 - rss_len, 0);
+            if (n <= 0) break;
+            rss_len += n;
+        }
+        rss[rss_len] = '\0';
+        close(fd);
+
+        /* Skip HTTP headers */
+        char *body = strstr(rss, "\r\n\r\n");
+        if (!body) { free(rss); return -1; }
+        body += 4;
+
+        /* Find first <item> */
+        char *item = strstr(body, "<item");
+        if (!item) { free(rss); return -1; }
+
+        /* Find <enclosure url="..." */
+        char *enc = strstr(item, "<enclosure");
+        if (!enc) { free(rss); return -1; }
+        char *url_attr = strstr(enc, "url=\"");
+        if (!url_attr) { free(rss); return -1; }
+        url_attr += 5;
+        char *url_end = strchr(url_attr, '"');
+        if (!url_end) { free(rss); return -1; }
+
+        int url_len = url_end - url_attr;
+        if (url_len >= (int)sizeof(state.podcast_ep_url))
+            url_len = sizeof(state.podcast_ep_url) - 1;
+        memcpy(state.podcast_ep_url, url_attr, url_len);
+        state.podcast_ep_url[url_len] = '\0';
+
+        /* Parse URL into host/port/path */
+        char *ep = state.podcast_ep_url;
+        state.podcast_ep_port = 80;
+        if (strncmp(ep, "http://", 7) == 0) ep += 7;
+        else if (strncmp(ep, "https://", 8) == 0) { ep += 8; state.podcast_ep_port = 80; }
+
+        char *ep_slash = strchr(ep, '/');
+        if (ep_slash) {
+            strncpy(state.podcast_ep_path, ep_slash, sizeof(state.podcast_ep_path) - 1);
+            int hn = ep_slash - ep;
+            if (hn >= (int)sizeof(state.podcast_ep_host))
+                hn = sizeof(state.podcast_ep_host) - 1;
+            memcpy(state.podcast_ep_host, ep, hn);
+            state.podcast_ep_host[hn] = '\0';
+        }
+
+        /* Extract port from host if present */
+        char *colon = strchr(state.podcast_ep_host, ':');
+        if (colon) {
+            state.podcast_ep_port = atoi(colon + 1);
+            *colon = '\0';
+        }
+
+        /* Find <pubDate> within the <item> */
+        state.podcast_date[0] = '\0';
+        char *pub = strstr(item, "<pubDate>");
+        if (pub) {
+            pub += 9;
+            char *pub_end = strstr(pub, "</pubDate>");
+            if (pub_end) {
+                /* Extract "Mon, 13 Mar 2026" from RFC 2822 date */
+                /* Skip day-of-week prefix like "Thu, " */
+                char *comma = strchr(pub, ',');
+                if (comma && comma < pub_end) pub = comma + 2;
+                int plen = pub_end - pub;
+                /* Take just "13 Mar 2026" (first ~11 chars) */
+                if (plen > 11) plen = 11;
+                if (plen >= (int)sizeof(state.podcast_date))
+                    plen = sizeof(state.podcast_date) - 1;
+                memcpy(state.podcast_date, pub, plen);
+                state.podcast_date[plen] = '\0';
+                /* Trim trailing spaces */
+                while (plen > 0 && state.podcast_date[plen-1] == ' ')
+                    state.podcast_date[--plen] = '\0';
+            }
+        }
+
+        printf("Podcast episode: %s\n", state.podcast_ep_url);
+        printf("Podcast date: %s\n", state.podcast_date);
+        free(rss);
+        return 0;
+    }
+    return -1;
+}
+
+static int podcast_connect(void)
+{
+    struct in_addr addr;
+    if (dns_resolve(state.podcast_ep_host, &addr) < 0) {
+        fprintf(stderr, "DNS failed for %s\n", state.podcast_ep_host);
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = {.tv_sec = 10};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(state.podcast_ep_port);
+    sa.sin_addr = addr;
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        fprintf(stderr, "Podcast connect failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    char req[1024];
+    int len = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.0\r\n"
+        "Host: %s\r\n"
+        "User-Agent: ShelbournePlayer/1.0\r\n"
+        "Accept: */*\r\n"
+        "\r\n",
+        state.podcast_ep_path, state.podcast_ep_host);
+    if (send(fd, req, len, 0) != len) { close(fd); return -1; }
+
+    /* Read headers, follow redirects */
+    char hdr[4096];
+    int hlen = 0;
+    while (hlen < (int)sizeof(hdr) - 1) {
+        char c;
+        if (recv(fd, &c, 1, 0) != 1) break;
+        hdr[hlen++] = c;
+        if (hlen >= 4 && hdr[hlen-4]=='\r' && hdr[hlen-3]=='\n' &&
+            hdr[hlen-2]=='\r' && hdr[hlen-1]=='\n') break;
+    }
+    hdr[hlen] = '\0';
+
+    if (strstr(hdr, " 301") || strstr(hdr, " 302")) {
+        char *loc = strstr(hdr, "Location: ");
+        if (!loc) loc = strstr(hdr, "location: ");
+        if (loc) {
+            loc += 10;
+            char *end = strstr(loc, "\r\n");
+            if (end) *end = '\0';
+            printf("Podcast redirect: %s\n", loc);
+            close(fd);
+
+            /* Parse redirect URL */
+            char *p = loc;
+            state.podcast_ep_port = 80;
+            if (strncmp(p, "http://", 7) == 0) p += 7;
+            else if (strncmp(p, "https://", 8) == 0) p += 8;
+
+            char *sl = strchr(p, '/');
+            if (sl) {
+                strncpy(state.podcast_ep_path, sl, sizeof(state.podcast_ep_path) - 1);
+                int hn = sl - p;
+                if (hn >= (int)sizeof(state.podcast_ep_host))
+                    hn = sizeof(state.podcast_ep_host) - 1;
+                memcpy(state.podcast_ep_host, p, hn);
+                state.podcast_ep_host[hn] = '\0';
+            }
+            char *col = strchr(state.podcast_ep_host, ':');
+            if (col) { state.podcast_ep_port = atoi(col+1); *col = '\0'; }
+
+            return podcast_connect();  /* one level of redirect */
+        }
+    }
+
+    printf("Podcast stream ready\n");
+    return fd;
+}
+
+static void play_podcast(const source_t *src)
+{
+    /* Show logo immediately */
+    state.podcast_date[0] = '\0';
+    display_update();
+
+    printf("Fetching podcast feed...\n");
+    if (podcast_fetch_latest(src) < 0) {
+        fprintf(stderr, "Failed to fetch podcast feed\n");
+        display_update();
+        for (int w = 0; w < 50 && !INTERRUPTED(); w++) {
+            usleep(100000);
+            keypad_poll();
+        }
+        return;
+    }
+
+    display_update();  /* show date */
+
+    int sock = podcast_connect();
+    if (sock < 0) {
+        fprintf(stderr, "Failed to connect to podcast\n");
+        for (int w = 0; w < 30 && !INTERRUPTED(); w++) {
+            usleep(100000);
+            keypad_poll();
+        }
+        return;
+    }
+
+    mp3dec_t mp3d;
+    mp3dec_init(&mp3d);
+    audio_reset();
+
+    uint8_t stream_buf[MP3_BUF_SIZE * 2];
+    int buf_fill = 0;
+
+    /* Pre-buffer */
+    printf("Buffering podcast...\n");
+    {
+        struct timeval tv_buf = {.tv_sec = 5};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_buf, sizeof(tv_buf));
+        while (buf_fill < MP3_BUF_SIZE) {
+            int n = recv(sock, stream_buf + buf_fill,
+                         MP3_BUF_SIZE - buf_fill, 0);
+            if (n <= 0) break;
+            buf_fill += n;
+        }
+    }
+    printf("Buffered %d bytes\n", buf_fill);
+    fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
+
+    state.playing = 1;
+    display_update();
+
+    int stream_ended = 0;
+
+    while (!INTERRUPTED()) {
+        keypad_poll();
+
+        /* Handle pause */
+        while (state.cmd_pause && !INTERRUPTED()) {
+            state.cmd_pause = 0;
+            state.playing = 0;
+            display_update();
+            while (!state.cmd_pause && !INTERRUPTED()) {
+                usleep(50000);
+                keypad_poll();
+                if (state.display_dirty) {
+                    state.display_dirty = 0;
+                    display_update();
+                }
+            }
+            if (state.cmd_pause) {
+                state.cmd_pause = 0;
+                state.playing = 1;
+                audio_reset();
+                display_update();
+            }
+        }
+        if (INTERRUPTED()) break;
+
+        /* Top up buffer */
+        if (!stream_ended && buf_fill < (int)sizeof(stream_buf)) {
+            int n = recv(sock, stream_buf + buf_fill,
+                         sizeof(stream_buf) - buf_fill, 0);
+            if (n > 0) {
+                buf_fill += n;
+            } else if (n == 0) {
+                stream_ended = 1;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                stream_ended = 1;
+            }
+        }
+
+        /* Decode */
+        mp3dec_frame_info_t info;
+        mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+
+        int decoded_any = 0;
+        while (buf_fill >= 4 && !INTERRUPTED() && !state.cmd_pause) {
+            int samples = mp3dec_decode_frame(&mp3d,
+                stream_buf, buf_fill, pcm, &info);
+
+            if (info.frame_bytes > 0) {
+                decoded_any = 1;
+                buf_fill -= info.frame_bytes;
+                memmove(stream_buf, stream_buf + info.frame_bytes, buf_fill);
+
+                if (samples > 0 && info.hz > 0)
+                    convert_and_write(pcm, samples, info.channels, info.hz);
+
+                shelbourne_audio_wait(state.hw);
+
+                if (!stream_ended && buf_fill < MP3_BUF_SIZE) {
+                    int n = recv(sock, stream_buf + buf_fill,
+                                 sizeof(stream_buf) - buf_fill, 0);
+                    if (n > 0) buf_fill += n;
+                    else if (n == 0) stream_ended = 1;
+                }
+
+                keypad_poll();
+
+                if (state.display_dirty) {
+                    state.display_dirty = 0;
+                    display_update();
+                }
+            } else if (buf_fill > MP3_BUF_SIZE) {
+                memmove(stream_buf, stream_buf + 1, buf_fill - 1);
+                buf_fill--;
+            } else {
+                break;
+            }
+        }
+
+        if (stream_ended && !decoded_any && buf_fill < 4) {
+            printf("Podcast finished\n");
+            break;
+        }
+    }
+
+    shelbourne_audio_drain(state.hw);
+    close(sock);
+    state.playing = 0;
+
+    /* Return to idle (clock) when podcast finishes naturally */
+    if (!INTERRUPTED()) {
+        state.active_preset = NUM_PRESETS;
+    }
+}
+
 /* ── Signal handling ───────────────────────────────────────────── */
 
 static void sig_handler(int sig)
@@ -1458,14 +1872,26 @@ int main(int argc, char *argv[])
             play_aux();
         } else if (src && src->type == SRC_RADIO) {
             play_radio(src);
+        } else if (src && src->type == SRC_PODCAST) {
+            play_podcast(src);
         } else if (src && src->type == SRC_DIR) {
             play_usb(src);
         } else {
-            /* Empty preset or no source — wait for input */
+            /* Idle — show clock, update every minute */
             display_update();
             while (!INTERRUPTED() && !state.cmd_aux) {
                 usleep(100000);
                 keypad_poll();
+                /* Refresh clock every ~10s */
+                static int idle_ticks;
+                if (++idle_ticks >= 100) {
+                    idle_ticks = 0;
+                    state.display_dirty = 1;
+                }
+                if (state.display_dirty) {
+                    state.display_dirty = 0;
+                    display_update();
+                }
             }
         }
 
