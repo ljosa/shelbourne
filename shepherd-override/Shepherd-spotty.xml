@@ -1,5 +1,3 @@
 <ShepherdConfig>
-  <daemon name="/mnt/nv/player" path="/mnt/nv/player">
-    <arg>/media/sda1</arg>
-  </daemon>
+  <daemon name="/mnt/nv/player"/>
 </ShepherdConfig>

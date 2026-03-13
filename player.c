@@ -121,6 +121,9 @@ static struct {
 
     /* Radio */
     int radio_fd;
+    int icy_metaint;         /* bytes between metadata blocks (0 = no ICY) */
+    int icy_remaining;       /* bytes until next metadata block */
+    char stream_title[256];  /* current ICY StreamTitle */
 
     /* Audio */
     int playing;
@@ -139,6 +142,8 @@ static struct {
 
     /* Display */
     int display_dirty;
+    struct timespec logo_shown_at;  /* when logo was first displayed */
+    int logo_expired;               /* set once after 5s logo timeout */
 } state;
 
 /* ── Resampler ─────────────────────────────────────────────────── */
@@ -457,23 +462,59 @@ static void display_update(void)
         display_logo(logo_aux);
 
     } else if (src && src->type == SRC_RADIO) {
-        /* Radio mode — full-screen logo */
-        if (src->logo) {
-            display_logo(src->logo);
+        /* Radio mode — blank when paused, logo for first 5s, then metadata */
+        if (!state.playing) {
+            /* Paused/stopped — blank screen (already cleared above) */
         } else {
-            fb_center_2x(18, src->name);
+            int show_meta = 0;
+            if (state.stream_title[0]) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long ms = (now.tv_sec - state.logo_shown_at.tv_sec) * 1000L +
+                          (now.tv_nsec - state.logo_shown_at.tv_nsec) / 1000000;
+                if (ms >= 5000) show_meta = 1;
+            }
+
+            if (show_meta) {
+                /* Station name at top in big font */
+                fb_center_2x(2, src->name);
+
+                /* Stream title — word-wrap across up to 4 lines */
+                const char *title = state.stream_title;
+                int y = 28;
+                while (*title && y < 80) {
+                    int len = strlen(title);
+                    int line_chars = len < DISP_COLS ? len : DISP_COLS;
+                    /* Break at last space within line width */
+                    if (len > DISP_COLS) {
+                        int brk = DISP_COLS;
+                        while (brk > 0 && title[brk] != ' ') brk--;
+                        if (brk > 0) line_chars = brk;
+                    }
+                    char line[DISP_COLS + 1];
+                    memcpy(line, title, line_chars);
+                    line[line_chars] = '\0';
+                    fb_center(y, line);
+                    title += line_chars;
+                    while (*title == ' ') title++;
+                    y += CHAR_H + 2;
+                }
+            } else if (src->logo) {
+                display_logo(src->logo);
+            } else {
+                fb_center_2x(18, src->name);
+            }
         }
 
-        if (!state.playing)
-            fb_center(90, "Connecting...");
-
     } else if (src && src->type == SRC_DIR) {
-        /* USB mode */
-        char hdr[8];
-        snprintf(hdr, sizeof(hdr), "P%d", state.active_preset + 1);
-        fb_putstr(0, 2, hdr);
+        /* USB mode — blank when paused */
+        if (!state.playing) {
+            /* Paused — blank screen (already cleared above) */
+        } else if (state.num_tracks > 0) {
+            char hdr[8];
+            snprintf(hdr, sizeof(hdr), "P%d", state.active_preset + 1);
+            fb_putstr(0, 2, hdr);
 
-        if (state.num_tracks > 0) {
             char idx[12];
             snprintf(idx, sizeof(idx), "%d/%d",
                      state.current_track + 1, state.num_tracks);
@@ -496,8 +537,6 @@ static void display_update(void)
                 snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->album);
                 fb_center(50, line);
             }
-
-            fb_center(66, state.playing ? "Playing" : "Paused");
         } else {
             fb_center_2x(18, "No tracks");
         }
@@ -597,7 +636,7 @@ static int dns_resolve(const char *hostname, struct in_addr *out)
     if (!(resp[2] & 0x80)) return -1;
     if ((resp[3] & 0x0F) != 0) return -1;
 
-    int ancount = (resp[4] << 8) | resp[5];
+    int ancount = (resp[6] << 8) | resp[7];
     if (ancount == 0) return -1;
 
     int roff = 12;
@@ -907,6 +946,7 @@ static int radio_connect(const source_t *src)
             "GET %s HTTP/1.0\r\n"
             "Host: %s\r\n"
             "User-Agent: ShelbournePlayer/1.0\r\n"
+            "Icy-MetaData: 1\r\n"
             "Accept: */*\r\n"
             "\r\n",
             path, host);
@@ -929,6 +969,15 @@ static int radio_connect(const source_t *src)
 
         /* Check for redirect */
         if (!strstr(hdr, " 301") && !strstr(hdr, " 302")) {
+            /* Parse icy-metaint for metadata stripping */
+            state.icy_metaint = 0;
+            char *mi = strstr(hdr, "icy-metaint:");
+            if (mi) {
+                state.icy_metaint = atoi(mi + 12);
+                printf("ICY metaint: %d\n", state.icy_metaint);
+            }
+            state.icy_remaining = state.icy_metaint;
+            state.stream_title[0] = '\0';
             printf("Radio connected: %s\n", src->name);
             return fd;
         }
@@ -977,6 +1026,94 @@ static int radio_connect(const source_t *src)
     return -1;
 }
 
+/* ── ICY metadata stripping ────────────────────────────────────── */
+
+static void parse_icy_metadata(const char *meta, int meta_len)
+{
+    /* Format: StreamTitle='Artist - Song';StreamUrl=''; */
+    const char *p = strstr(meta, "StreamTitle='");
+    if (!p) return;
+    p += 13;
+    const char *end = strchr(p, '\'');
+    if (!end) return;
+    int len = end - p;
+    if (len <= 0) return;
+    if (len > (int)sizeof(state.stream_title) - 1)
+        len = sizeof(state.stream_title) - 1;
+    if (len == (int)strlen(state.stream_title) &&
+        memcmp(state.stream_title, p, len) == 0)
+        return;  /* unchanged */
+    memcpy(state.stream_title, p, len);
+    state.stream_title[len] = '\0';
+    printf("ICY title: %s\n", state.stream_title);
+    state.display_dirty = 1;
+}
+
+/*
+ * Blocking read of exactly `len` bytes. Used for ICY metadata which is
+ * tiny (1-257 bytes) and immediately follows audio data in the TCP stream.
+ * Temporarily clears O_NONBLOCK if needed.
+ */
+static int recv_exact(int fd, void *buf, int len)
+{
+    int flags = fcntl(fd, F_GETFL);
+    int was_nonblock = flags & O_NONBLOCK;
+    if (was_nonblock)
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    int got = 0;
+    while (got < len) {
+        int n = recv(fd, (uint8_t *)buf + got, len - got, 0);
+        if (n <= 0) {
+            if (was_nonblock) fcntl(fd, F_SETFL, flags);
+            return -1;
+        }
+        got += n;
+    }
+
+    if (was_nonblock)
+        fcntl(fd, F_SETFL, flags);
+    return got;
+}
+
+/*
+ * Read from stream socket, stripping ICY metadata blocks.
+ * Returns bytes of audio data written to buf, or <=0 on error/EOF.
+ * Safe with both blocking and non-blocking sockets.
+ */
+static int icy_recv(int fd, uint8_t *buf, int maxlen)
+{
+    if (state.icy_metaint == 0)
+        return recv(fd, buf, maxlen, 0);
+
+    /* Only read up to the next metadata boundary */
+    int want = state.icy_remaining;
+    if (want > maxlen) want = maxlen;
+
+    int n = recv(fd, buf, want, 0);
+    if (n <= 0) return n;
+    state.icy_remaining -= n;
+
+    /* If we hit the metadata boundary, consume the metadata block */
+    if (state.icy_remaining == 0) {
+        uint8_t mlen_byte;
+        if (recv_exact(fd, &mlen_byte, 1) < 0)
+            return n;  /* return audio we got; metadata read fails next time */
+
+        int meta_len = mlen_byte * 16;
+        if (meta_len > 0) {
+            char meta[4096];
+            if (recv_exact(fd, meta, meta_len) >= 0) {
+                meta[meta_len] = '\0';
+                parse_icy_metadata(meta, meta_len);
+            }
+        }
+        state.icy_remaining = state.icy_metaint;
+    }
+
+    return n;
+}
+
 static void play_radio(const source_t *src)
 {
     mp3dec_t mp3d;
@@ -1001,6 +1138,7 @@ static void play_radio(const source_t *src)
 
         audio_reset();
         state.radio_fd = sock;
+        state.stream_title[0] = '\0';
         buf_fill = 0;
 
         /* Pre-buffer */
@@ -1010,8 +1148,8 @@ static void play_radio(const source_t *src)
             struct timeval tv_buf = {.tv_sec = 5};
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_buf, sizeof(tv_buf));
             while (buf_fill < MP3_BUF_SIZE) {
-                int n = recv(sock, stream_buf + buf_fill,
-                             MP3_BUF_SIZE - buf_fill, 0);
+                int n = icy_recv(sock, stream_buf + buf_fill,
+                                 MP3_BUF_SIZE - buf_fill);
                 if (n <= 0) break;
                 buf_fill += n;
             }
@@ -1020,6 +1158,8 @@ static void play_radio(const source_t *src)
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
 
         state.playing = 1;
+        state.logo_expired = 0;
+        clock_gettime(CLOCK_MONOTONIC, &state.logo_shown_at);
         display_update();
 
         while (!INTERRUPTED()) {
@@ -1049,8 +1189,8 @@ static void play_radio(const source_t *src)
 
             /* Top up buffer */
             if (buf_fill < (int)sizeof(stream_buf)) {
-                int n = recv(sock, stream_buf + buf_fill,
-                             sizeof(stream_buf) - buf_fill, 0);
+                int n = icy_recv(sock, stream_buf + buf_fill,
+                                 sizeof(stream_buf) - buf_fill);
                 if (n > 0) {
                     buf_fill += n;
                 } else if (n == 0) {
@@ -1080,12 +1220,25 @@ static void play_radio(const source_t *src)
                     shelbourne_audio_wait(state.hw);
 
                     if (buf_fill < MP3_BUF_SIZE) {
-                        int n = recv(sock, stream_buf + buf_fill,
-                                     sizeof(stream_buf) - buf_fill, 0);
+                        int n = icy_recv(sock, stream_buf + buf_fill,
+                                         sizeof(stream_buf) - buf_fill);
                         if (n > 0) buf_fill += n;
                     }
 
                     keypad_poll();
+
+                    /* Trigger display refresh when logo timeout expires */
+                    if (!state.logo_expired && state.stream_title[0]) {
+                        struct timespec now;
+                        clock_gettime(CLOCK_MONOTONIC, &now);
+                        long ms = (now.tv_sec - state.logo_shown_at.tv_sec) * 1000L +
+                                  (now.tv_nsec - state.logo_shown_at.tv_nsec) / 1000000;
+                        if (ms >= 5000) {
+                            state.logo_expired = 1;
+                            state.display_dirty = 1;
+                        }
+                    }
+
                     if (state.display_dirty) {
                         state.display_dirty = 0;
                         display_update();
@@ -1272,7 +1425,7 @@ int main(int argc, char *argv[])
     setbuf(stderr, NULL);
 
     memset(&state, 0, sizeof(state));
-    state.active_preset = 0;   /* start on preset 1 */
+    state.active_preset = NUM_PRESETS;  /* idle — no source selected */
     state.cmd_preset = -1;
     state.radio_fd = -1;
     state.volume = DEFAULT_VOL;
@@ -1283,6 +1436,7 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
 
     /* Initialize hardware */
+    shelbourne_stop_stock_processes();
     state.hw = shelbourne_init();
     if (!state.hw) {
         fprintf(stderr, "Hardware init failed\n");
@@ -1292,9 +1446,8 @@ int main(int argc, char *argv[])
     /* LED always off */
     shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
 
-    /* Startup screen */
+    /* Start with blank display */
     shelbourne_display_clear(state.hw);
-    fb_center_2x(20, "Starting");
     shelbourne_display_flush(state.hw);
 
     /* Main loop */
