@@ -155,8 +155,19 @@ static struct {
     volatile int cmd_preset;  /* 0-5, or -1 for none */
 
     /* Display */
-    int display_dirty;
+    int display_dirty;          /* immediate refresh (keypress, mode change) */
+    int scroll_dirty;           /* deferred refresh (scroll animation) */
+    long last_scroll_flush_ms;  /* throttle scroll-driven flushes */
 } state;
+
+#define SCROLL_FLUSH_INTERVAL_MS 300  /* max ~3 fps for scroll updates */
+
+static long player_mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+}
 
 /* ── Resampler ─────────────────────────────────────────────────── */
 
@@ -297,10 +308,11 @@ static void display_update(void)
             if (state.podcast_date[0])
                 fb_center_2x(74, state.podcast_date);
         } else if (state.stream_title[0]) {
-            /* Radio with ICY metadata — logo + title */
+            /* Radio with ICY metadata — logo + scrolling title */
             if (src->logo)
                 display_logo(src->logo);
-            fb_wrap_2x(54, SHELBOURNE_FB_HEIGHT - 16, state.stream_title);
+            if (fb_scroll_2x(54, state.stream_title))
+                state.scroll_dirty = 1;
         } else {
             /* Radio, no metadata yet — logo + name */
             if (src->logo)
@@ -320,11 +332,13 @@ static void display_update(void)
                      state.current_track + 1, state.num_tracks);
             fb_putstr(SHELBOURNE_FB_WIDTH - fb_text_width(idx), 0, idx);
 
-            /* Title in big font, word-wrapped */
-            int y = fb_wrap_2x(12, 50, t->title);
+            /* Title — scroll if too long */
+            if (fb_scroll_2x(14, t->title))
+                state.scroll_dirty = 1;
 
+            int y = 14 + 21;  /* below title */
             if (t->artist[0])
-                y = fb_wrap_2x(y + 2, 80, t->artist);
+                y = fb_wrap_2x(y, 70, t->artist);
             if (t->album[0])
                 fb_wrap_2x(y + 2, 96, t->album);
         } else {
@@ -910,7 +924,16 @@ static void play_radio(const source_t *src)
 
                     if (state.display_dirty) {
                         state.display_dirty = 0;
+                        state.scroll_dirty = 0;
                         display_update();
+                        state.last_scroll_flush_ms = player_mono_ms();
+                    } else if (state.scroll_dirty) {
+                        long now = player_mono_ms();
+                        if (now - state.last_scroll_flush_ms >= SCROLL_FLUSH_INTERVAL_MS) {
+                            state.scroll_dirty = 0;
+                            display_update();
+                            state.last_scroll_flush_ms = now;
+                        }
                     }
                 } else if (buf_fill > MP3_BUF_SIZE) {
                     memmove(stream_buf, stream_buf + 1, buf_fill - 1);
@@ -984,7 +1007,16 @@ static void play_usb(const source_t *src)
 
             if (state.display_dirty) {
                 state.display_dirty = 0;
+                state.scroll_dirty = 0;
                 display_update();
+                state.last_scroll_flush_ms = player_mono_ms();
+            } else if (state.scroll_dirty) {
+                long now = player_mono_ms();
+                if (now - state.last_scroll_flush_ms >= SCROLL_FLUSH_INTERVAL_MS) {
+                    state.scroll_dirty = 0;
+                    display_update();
+                    state.last_scroll_flush_ms = now;
+                }
             }
         }
 

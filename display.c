@@ -8,6 +8,7 @@
 #include "display.h"
 #include "fonts.h"
 #include <string.h>
+#include <time.h>
 
 static shelbourne_t *hw;
 
@@ -18,27 +19,69 @@ void display_init(shelbourne_t *h)
 
 /* ── Generic proportional font renderer ──────────────────────── */
 
-static int glyph_width(const font_t *f, char c)
+/*
+ * Decode one UTF-8 character, return codepoint and advance *pos.
+ * Returns '?' for invalid sequences or codepoints outside our font range.
+ */
+static int utf8_decode(const char *s, int *pos)
 {
-    if (c < 32 || c > 126) c = '?';
-    return f->widths[c - 32];
+    unsigned char c = (unsigned char)s[*pos];
+    int cp;
+
+    if (c < 0x80) {
+        cp = c;
+        (*pos)++;
+    } else if ((c & 0xE0) == 0xC0) {
+        /* 2-byte: U+0080..U+07FF */
+        cp = (c & 0x1F) << 6;
+        if (s[*pos + 1])
+            cp |= ((unsigned char)s[*pos + 1] & 0x3F);
+        *pos += 2;
+    } else if ((c & 0xF0) == 0xE0) {
+        /* 3-byte: U+0800..U+FFFF */
+        cp = (c & 0x0F) << 12;
+        if (s[*pos + 1]) {
+            cp |= ((unsigned char)s[*pos + 1] & 0x3F) << 6;
+            if (s[*pos + 2])
+                cp |= ((unsigned char)s[*pos + 2] & 0x3F);
+        }
+        *pos += 3;
+    } else if ((c & 0xF8) == 0xF0) {
+        /* 4-byte: U+10000..U+10FFFF */
+        cp = '?';
+        *pos += 4;
+    } else {
+        cp = '?';
+        (*pos)++;
+    }
+
+    /* Map to font index or fallback */
+    if (cp < FONT_FIRST_CHAR || cp > FONT_LAST_CHAR)
+        cp = '?';
+    return cp;
+}
+
+static int glyph_width_cp(const font_t *f, int cp)
+{
+    return f->widths[cp - FONT_FIRST_CHAR];
 }
 
 static int string_width(const font_t *f, const char *s)
 {
-    int w = 0;
-    for (int i = 0; s[i]; i++)
-        w += glyph_width(f, s[i]);
+    int w = 0, pos = 0;
+    while (s[pos]) {
+        int cp = utf8_decode(s, &pos);
+        w += glyph_width_cp(f, cp);
+    }
     return w;
 }
 
-static void draw_char(const font_t *f, int x, int y, char c)
+static void draw_char_cp(const font_t *f, int x, int y, int cp)
 {
     uint8_t *fb = shelbourne_display_buffer(hw);
     if (!fb) return;
-    if (c < 32 || c > 126) c = '?';
 
-    int idx = c - 32;
+    int idx = cp - FONT_FIRST_CHAR;
     int w = f->widths[idx];
     int h = f->height;
     const uint8_t *data = f->data + f->offsets[idx];
@@ -64,9 +107,11 @@ static void draw_char(const font_t *f, int x, int y, char c)
 
 static void draw_string(const font_t *f, int x, int y, const char *s)
 {
-    for (int i = 0; s[i]; i++) {
-        draw_char(f, x, y, s[i]);
-        x += glyph_width(f, s[i]);
+    int pos = 0;
+    while (s[pos]) {
+        int cp = utf8_decode(s, &pos);
+        draw_char_cp(f, x, y, cp);
+        x += glyph_width_cp(f, cp);
     }
 }
 
@@ -104,42 +149,119 @@ int fb_wrap_2x(int y, int y_max, const char *text)
     int line_h = font_medium.height + 2;
 
     while (*text && y + font_medium.height <= y_max) {
-        /* Find how many chars fit on one line */
+        /* Find how many bytes fit on one line (UTF-8 aware) */
         int len = strlen(text);
-        int line_chars = 0;
+        int line_bytes = 0;
         int line_w = 0;
+        int pos = 0;
 
-        for (int i = 0; i < len; i++) {
-            int cw = glyph_width(&font_medium, text[i]);
+        while (pos < len) {
+            int cp = utf8_decode(text, &pos);
+            int cw = glyph_width_cp(&font_medium, cp);
             if (line_w + cw > SHELBOURNE_FB_WIDTH)
                 break;
             line_w += cw;
-            line_chars = i + 1;
+            line_bytes = pos;
         }
 
-        if (line_chars == 0) line_chars = 1;  /* at least one char */
+        if (line_bytes == 0) {
+            /* At least one character */
+            pos = 0;
+            utf8_decode(text, &pos);
+            line_bytes = pos;
+        }
 
         /* Word-break: if not at end, back up to last space */
-        if (line_chars < len) {
-            int brk = line_chars;
+        if (line_bytes < len) {
+            int brk = line_bytes;
             while (brk > 0 && text[brk] != ' ') brk--;
-            if (brk > 0) line_chars = brk;
+            if (brk > 0) line_bytes = brk;
         }
 
         /* Render this line centered */
-        char line[128];
-        if (line_chars >= (int)sizeof(line))
-            line_chars = sizeof(line) - 1;
-        memcpy(line, text, line_chars);
-        line[line_chars] = '\0';
+        char line[256];
+        if (line_bytes >= (int)sizeof(line))
+            line_bytes = sizeof(line) - 1;
+        memcpy(line, text, line_bytes);
+        line[line_bytes] = '\0';
         draw_centered(&font_medium, y, line);
 
-        text += line_chars;
+        text += line_bytes;
         while (*text == ' ') text++;
         y += line_h;
     }
     return y;
 }
+
+/* ── Auto-scrolling marquee ───────────────────────────────────── */
+
+#define SCROLL_SPEED    30      /* pixels per second */
+#define SCROLL_PAUSE_MS 1500    /* pause at start and end */
+
+static struct {
+    char text[256];
+    int y;
+    int text_width;
+    long start_ms;          /* monotonic timestamp when scroll began */
+    int total_travel;       /* total pixels to scroll before reset */
+} scroll;
+
+static long mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+}
+
+int fb_scroll_2x(int y, const char *text)
+{
+    int tw = string_width(&font_medium, text);
+
+    /* If text fits, just center it — no scroll needed */
+    if (tw <= SHELBOURNE_FB_WIDTH) {
+        scroll.text[0] = '\0';
+        draw_centered(&font_medium, y, text);
+        return 0;
+    }
+
+    /* Detect text/position change → reset scroll */
+    if (y != scroll.y || strcmp(text, scroll.text) != 0) {
+        strncpy(scroll.text, text, sizeof(scroll.text) - 1);
+        scroll.text[sizeof(scroll.text) - 1] = '\0';
+        scroll.y = y;
+        scroll.text_width = tw;
+        scroll.start_ms = mono_ms();
+        scroll.total_travel = tw - SHELBOURNE_FB_WIDTH;
+    }
+
+    /* Compute scroll offset from elapsed time */
+    long elapsed = mono_ms() - scroll.start_ms;
+    int offset;
+
+    if (elapsed < SCROLL_PAUSE_MS) {
+        offset = 0;
+    } else {
+        long scroll_ms = elapsed - SCROLL_PAUSE_MS;
+        offset = (int)(scroll_ms * SCROLL_SPEED / 1000);
+
+        if (offset >= scroll.total_travel) {
+            long end_pause_start = SCROLL_PAUSE_MS +
+                (long)scroll.total_travel * 1000 / SCROLL_SPEED;
+            if (elapsed < end_pause_start + SCROLL_PAUSE_MS) {
+                offset = scroll.total_travel;
+            } else {
+                /* Reset cycle */
+                scroll.start_ms = mono_ms();
+                offset = 0;
+            }
+        }
+    }
+
+    draw_string(&font_medium, -offset, y, text);
+    return 1;
+}
+
+/* ── Logo ────────────────────────────────────────────────────── */
 
 void display_logo(const uint8_t *logo)
 {

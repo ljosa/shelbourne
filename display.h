@@ -15,6 +15,13 @@ int fb_text_width(const char *s);  /* measure width in pixels */
 void fb_center_2x(int y, const char *s);
 int fb_wrap_2x(int y, int y_max, const char *text);
 
+/*
+ * Auto-scrolling medium text.  Centers if text fits; otherwise
+ * scrolls left.  Returns 1 if scrolling (caller should schedule
+ * another refresh — but throttled, not every frame).
+ */
+int fb_scroll_2x(int y, const char *text);
+
 /* Large text (proportional bold, ~33px) — for clock display */
 void fb_center_4x(int y, const char *s);
 

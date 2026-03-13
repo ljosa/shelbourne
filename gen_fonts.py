@@ -20,9 +20,9 @@ from PIL import Image, ImageDraw, ImageFont
 FONT_PATH = "/tmp/dejavu/dejavu-fonts-ttf-2.37/ttf/DejaVuSans.ttf"
 FONT_BOLD_PATH = "/tmp/dejavu/dejavu-fonts-ttf-2.37/ttf/DejaVuSans-Bold.ttf"
 
-# ASCII 32-126
+# Codepoints 32-255 (ASCII + Latin-1 Supplement)
 FIRST_CHAR = 32
-LAST_CHAR = 126
+LAST_CHAR = 255
 NUM_CHARS = LAST_CHAR - FIRST_CHAR + 1
 
 # Display dimensions
@@ -146,10 +146,14 @@ def generate_header(sizes_data):
     lines.append("")
     lines.append("#include <stdint.h>")
     lines.append("")
+    lines.append(f"#define FONT_FIRST_CHAR {FIRST_CHAR}")
+    lines.append(f"#define FONT_LAST_CHAR  {LAST_CHAR}")
+    lines.append(f"#define FONT_NUM_CHARS  {NUM_CHARS}")
+    lines.append("")
     lines.append("typedef struct {")
     lines.append("    uint8_t height;")
-    lines.append("    const uint8_t widths[95];    /* ASCII 32-126 */")
-    lines.append("    const uint16_t offsets[95];  /* byte offset into data[] */")
+    lines.append(f"    const uint8_t widths[{NUM_CHARS}];")
+    lines.append(f"    const uint32_t offsets[{NUM_CHARS}];")
     lines.append("    const uint8_t *data;")
     lines.append("} font_t;")
     lines.append("")
