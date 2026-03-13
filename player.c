@@ -245,7 +245,7 @@ static void draw_volume_bar(void)
     /* Volume number */
     char vol[4];
     snprintf(vol, sizeof(vol), "%d", state.volume);
-    fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(vol) * SMALL_CHAR_W - 2, bar_y + 3, vol);
+    fb_putstr(SHELBOURNE_FB_WIDTH - fb_text_width(vol) - 2, bar_y + 3, vol);
 }
 
 static int vol_bar_visible(void)
@@ -318,7 +318,7 @@ static void display_update(void)
             char idx[16];
             snprintf(idx, sizeof(idx), "%d/%d",
                      state.current_track + 1, state.num_tracks);
-            fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(idx) * SMALL_CHAR_W, 0, idx);
+            fb_putstr(SHELBOURNE_FB_WIDTH - fb_text_width(idx), 0, idx);
 
             /* Title in big font, word-wrapped */
             int y = fb_wrap_2x(12, 50, t->title);
