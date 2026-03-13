@@ -1,19 +1,17 @@
 /*
  * player.c — MP3/radio/AUX player using the Shelbourne library
  *
- * Usage on device:
- *   /mnt/nv/player [/media/sda1]
- *
  * Controls:
- *   Volume Up/Down = Adjust volume (+/- 5)
- *   Preset 1-6     = Radio stations
- *   AUX            = Switch to AUX input / next track (USB)
- *   Power          = Pause/Play toggle
+ *   Volume Up/Down  = Adjust volume (+/- 5, minimum 5)
+ *   Preset 1-4      = Select source (press again to cycle)
+ *   AUX             = Switch to AUX input
+ *   Power           = Pause/Play (radio/USB), Mute (AUX)
  */
 
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 #include "shelbourne.h"
+#include "station_logos.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -27,6 +25,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── Configuration ─────────────────────────────────────────────── */
@@ -36,25 +35,67 @@
 #define MAX_TAG         256
 #define MP3_BUF_SIZE    (16 * 1024)
 #define DEFAULT_VOL     50
+#define MIN_VOL         5
+#define VOL_STEP        5
+#define VOL_BAR_MS      2000   /* volume bar display duration */
+#define NUM_PRESETS     6
 
-/* ── Radio stations ────────────────────────────────────────────── */
+/* ── Source model ──────────────────────────────────────────────── */
+
+enum source_type { SRC_RADIO, SRC_DIR };
 
 typedef struct {
+    enum source_type type;
     const char *name;
     const char *host;
     int         port;
     const char *path;
-} radio_station_t;
+    const char *dir;
+    const uint8_t *logo;
+} source_t;
 
-static const radio_station_t radio_stations[] = {
-    { "BBC World",   "stream.live.vc.bbcmedia.co.uk", 80, "/bbc_world_service" },
-    { "BBC Radio 4", "stream.live.vc.bbcmedia.co.uk", 80, "/bbc_radio_fourfm" },
-    { "BBC Radio 3", "stream.live.vc.bbcmedia.co.uk", 80, "/bbc_radio_three" },
-    { "BBC Radio 6", "stream.live.vc.bbcmedia.co.uk", 80, "/bbc_6music" },
-    { "WNYC FM",     "fm939.wnyc.org",                80, "/wnycfm" },
-    { "Classic FM",  "media-ice.musicradio.com",       80, "/ClassicFMMP3" },
+/* Preset 1: Vermont / BBC talk */
+static const source_t p1_sources[] = {
+    { SRC_RADIO, "VPR News",    "vpr.streamguys1.com",           80, "/vpr64",            .logo = logo_vpr },
+    { SRC_RADIO, "WDEV",        "playerservices.streamtheworld.com", 80, "/api/livestream-redirect/WDEVFM.mp3", .logo = logo_wdev },
+    { SRC_RADIO, "BBC World",   "stream.live.vc.bbcmedia.co.uk", 80, "/bbc_world_service", .logo = logo_bbc_ws },
 };
-#define NUM_STATIONS (sizeof(radio_stations) / sizeof(radio_stations[0]))
+
+/* Preset 2: NRK (Norway) */
+static const source_t p2_sources[] = {
+    { SRC_RADIO, "NRK P1",     "lyd.nrk.no", 80, "/icecast/mp3/high/s0w7hwn47m/p1", .logo = logo_nrk_p1 },
+    { SRC_RADIO, "NRK P2",     "lyd.nrk.no", 80, "/icecast/mp3/high/s0w7hwn47m/p2", .logo = logo_nrk_p2 },
+    { SRC_RADIO, "NRK P3",     "lyd.nrk.no", 80, "/icecast/mp3/high/s0w7hwn47m/p3", .logo = logo_nrk_p3 },
+};
+
+/* Preset 3: Rock + SomaFM */
+static const source_t p3_sources[] = {
+    { SRC_RADIO, "WBTZ",        "playerservices.streamtheworld.com", 80, "/api/livestream-redirect/WBTZFM.mp3", .logo = logo_wbtz },
+    { SRC_RADIO, "KROQ",        "live.amperwave.net",             80, "/direct/audacy-kroqfmmp3-imc", .logo = logo_kroq },
+    { SRC_RADIO, "Groove Salad","ice1.somafm.com",                80, "/groovesalad-128-mp3", .logo = logo_groovesalad },
+    { SRC_RADIO, "Indie Pop",   "ice1.somafm.com",                80, "/indiepop-128-mp3",    .logo = logo_indiepop },
+    { SRC_RADIO, "DEF CON",     "ice1.somafm.com",                80, "/defcon-128-mp3",      .logo = logo_defcon },
+};
+
+/* Preset 4: USB music */
+static const source_t p4_sources[] = {
+    { SRC_DIR, "USB Music", .dir = "/media/sda1", .logo = logo_usb },
+};
+
+typedef struct {
+    const source_t *sources;
+    int num_sources;
+    int current;
+} preset_t;
+
+static preset_t presets[NUM_PRESETS] = {
+    { p1_sources, sizeof(p1_sources)/sizeof(p1_sources[0]), 0 },
+    { p2_sources, sizeof(p2_sources)/sizeof(p2_sources[0]), 0 },
+    { p3_sources, sizeof(p3_sources)/sizeof(p3_sources[0]), 0 },
+    { p4_sources, sizeof(p4_sources)/sizeof(p4_sources[0]), 0 },
+    { NULL, 0, 0 },
+    { NULL, 0, 0 },
+};
 
 /* ── Track info ────────────────────────────────────────────────── */
 
@@ -68,43 +109,39 @@ typedef struct {
 
 /* ── Player state ──────────────────────────────────────────────── */
 
-enum player_mode { MODE_USB, MODE_RADIO, MODE_AUX };
-
 static struct {
     shelbourne_t *hw;
-    enum player_mode mode;
-    enum player_mode prev_mode;  /* mode to return to from AUX */
+    int active_preset;   /* 0-5, or -1 for AUX */
 
     /* USB */
     track_t tracks[MAX_FILES];
     int num_tracks;
     int current_track;
+    const char *usb_dir;  /* directory being played */
 
     /* Radio */
-    int current_station;
     int radio_fd;
 
     /* Audio */
     int playing;
 
-    /* Volume (software mixer) */
+    /* Volume */
     int volume;
-    int vol_gain;     /* fixed-point 16-bit: 0=mute, 65536=unity */
+    int vol_gain;
+    struct timespec vol_changed_at;
+    int vol_bar_active;
 
-    /* Commands from keypad */
-    volatile int cmd_next;
-    volatile int cmd_prev;
+    /* Commands */
     volatile int cmd_quit;
     volatile int cmd_pause;
-    volatile int cmd_mode_switch;
     volatile int cmd_aux;
-    volatile int cmd_station;  /* -1 = no change, 0-5 = preset */
+    volatile int cmd_preset;  /* 0-5, or -1 for none */
 
     /* Display */
     int display_dirty;
 } state;
 
-/* ── Resampler output buffer ──────────────────────────────────── */
+/* ── Resampler ─────────────────────────────────────────────────── */
 
 #define OUTBUF_FRAMES (SHELBOURNE_FRAMES_PER_WRITE * 4)
 static int32_t outbuf[OUTBUF_FRAMES * 2];
@@ -118,21 +155,15 @@ static void audio_reset(void)
     shelbourne_audio_reset(state.hw);
 }
 
-/*
- * Convert minimp3 output (16-bit PCM) to 32-bit 48kHz stereo,
- * apply volume gain, and write to shelbourne audio buffer.
- */
 static int convert_and_write(const mp3d_sample_t *pcm,
                              int in_frames, int channels, int sample_rate)
 {
     if (in_frames == 0) return 0;
-
     double step = (double)sample_rate / SHELBOURNE_SAMPLE_RATE;
 
     while (resample_frac < in_frames - 1) {
         int idx = (int)resample_frac;
         double frac = resample_frac - idx;
-
         for (int ch = 0; ch < 2; ch++) {
             int src_ch = (ch < channels) ? ch : 0;
             int32_t s0 = pcm[idx * channels + src_ch];
@@ -152,17 +183,14 @@ static int convert_and_write(const mp3d_sample_t *pcm,
             outbuf_fill = 0;
         }
     }
-
     resample_frac -= in_frames;
     if (resample_frac < 0) resample_frac = 0;
 
-    /* Flush accumulated frames to shelbourne buffer */
     if (outbuf_fill > 0) {
         if (shelbourne_audio_write(state.hw, outbuf, outbuf_fill) < 0)
             return -1;
         outbuf_fill = 0;
     }
-
     return 0;
 }
 
@@ -172,8 +200,12 @@ static int convert_and_write(const mp3d_sample_t *pcm,
 #define FONT_H 7
 #define CHAR_W 6
 #define CHAR_H 8
-#define DISP_COLS (SHELBOURNE_FB_WIDTH / CHAR_W)   /* 21 */
-#define DISP_ROWS (SHELBOURNE_FB_HEIGHT / CHAR_H)  /* 12 */
+#define DISP_COLS (SHELBOURNE_FB_WIDTH / CHAR_W)
+
+/* 2x scaled font metrics */
+#define BIG_CHAR_W 12
+#define BIG_CHAR_H 16
+#define BIG_COLS   (SHELBOURNE_FB_WIDTH / BIG_CHAR_W)  /* 10 */
 
 static const uint8_t font5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, /*   */
@@ -273,7 +305,7 @@ static const uint8_t font5x7[][5] = {
     {0x10,0x08,0x08,0x10,0x08}, /* ~ */
 };
 
-/* ── Text drawing (on shelbourne display buffer) ──────────────── */
+/* ── Text drawing ──────────────────────────────────────────────── */
 
 static void fb_putchar(int x, int y, char c)
 {
@@ -308,12 +340,173 @@ static void fb_center(int y, const char *s)
     fb_putstr(x, y, s);
 }
 
-static void fb_hline(int y, uint8_t val)
+/* 2x scaled text */
+static void fb_putchar_2x(int x, int y, char c)
 {
     uint8_t *fb = shelbourne_display_buffer(state.hw);
     if (!fb) return;
-    if (y >= 0 && y < SHELBOURNE_FB_HEIGHT)
-        memset(&fb[y * SHELBOURNE_FB_WIDTH], val, SHELBOURNE_FB_WIDTH);
+    if (c < 32 || c > 126) c = '?';
+    const uint8_t *glyph = font5x7[c - 32];
+    for (int col = 0; col < FONT_W; col++) {
+        uint8_t bits = glyph[col];
+        for (int row = 0; row < FONT_H; row++) {
+            uint8_t val = (bits & (1 << row)) ? 0xFF : 0x00;
+            for (int dy = 0; dy < 2; dy++)
+                for (int dx = 0; dx < 2; dx++) {
+                    int px = x + col * 2 + dx, py = y + row * 2 + dy;
+                    if (px >= 0 && px < SHELBOURNE_FB_WIDTH &&
+                        py >= 0 && py < SHELBOURNE_FB_HEIGHT)
+                        fb[py * SHELBOURNE_FB_WIDTH + px] = val;
+                }
+        }
+    }
+}
+
+static void fb_putstr_2x(int x, int y, const char *s)
+{
+    for (int i = 0; s[i] && x + BIG_CHAR_W <= SHELBOURNE_FB_WIDTH; i++) {
+        fb_putchar_2x(x, y, s[i]);
+        x += BIG_CHAR_W;
+    }
+}
+
+static void fb_center_2x(int y, const char *s)
+{
+    int len = strlen(s);
+    if (len > BIG_COLS) len = BIG_COLS;
+    int x = (SHELBOURNE_FB_WIDTH - len * BIG_CHAR_W) / 2;
+    fb_putstr_2x(x, y, s);
+}
+
+/* ── Volume bar ────────────────────────────────────────────────── */
+
+static void draw_volume_bar(void)
+{
+    uint8_t *fb = shelbourne_display_buffer(state.hw);
+    if (!fb) return;
+
+    int bar_y = SHELBOURNE_FB_HEIGHT - 14;
+    int bar_x = 4;
+    int bar_max_w = SHELBOURNE_FB_WIDTH - 32;
+    int fill_w = (state.volume * bar_max_w) / 100;
+
+    /* Clear bar area */
+    for (int y = bar_y; y < SHELBOURNE_FB_HEIGHT; y++)
+        memset(&fb[y * SHELBOURNE_FB_WIDTH], 0, SHELBOURNE_FB_WIDTH);
+
+    /* Outline */
+    for (int x = bar_x; x < bar_x + bar_max_w; x++) {
+        fb[bar_y * SHELBOURNE_FB_WIDTH + x] = 0x30;
+        fb[(SHELBOURNE_FB_HEIGHT - 3) * SHELBOURNE_FB_WIDTH + x] = 0x30;
+    }
+    for (int y = bar_y; y <= SHELBOURNE_FB_HEIGHT - 3; y++) {
+        fb[y * SHELBOURNE_FB_WIDTH + bar_x] = 0x30;
+        fb[y * SHELBOURNE_FB_WIDTH + bar_x + bar_max_w - 1] = 0x30;
+    }
+
+    /* Fill */
+    for (int y = bar_y + 2; y < SHELBOURNE_FB_HEIGHT - 4; y++)
+        for (int x = bar_x + 2; x < bar_x + 2 + fill_w; x++)
+            fb[y * SHELBOURNE_FB_WIDTH + x] = 0xFF;
+
+    /* Volume number */
+    char vol[4];
+    snprintf(vol, sizeof(vol), "%d", state.volume);
+    fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(vol) * CHAR_W - 2, bar_y + 3, vol);
+}
+
+static int vol_bar_visible(void)
+{
+    if (!state.vol_bar_active) return 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (now.tv_sec - state.vol_changed_at.tv_sec) * 1000L +
+              (now.tv_nsec - state.vol_changed_at.tv_nsec) / 1000000;
+    if (ms >= VOL_BAR_MS) {
+        state.vol_bar_active = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* ── Display ───────────────────────────────────────────────────── */
+
+static const source_t *active_source(void)
+{
+    if (state.active_preset < 0 || state.active_preset >= NUM_PRESETS)
+        return NULL;
+    preset_t *p = &presets[state.active_preset];
+    if (p->num_sources == 0) return NULL;
+    return &p->sources[p->current];
+}
+
+static void display_logo(const uint8_t *logo)
+{
+    uint8_t *fb = shelbourne_display_buffer(state.hw);
+    if (fb && logo)
+        memcpy(fb, logo, SHELBOURNE_FB_SIZE);
+}
+
+static void display_update(void)
+{
+    shelbourne_display_clear(state.hw);
+    const source_t *src = active_source();
+
+    if (state.active_preset < 0) {
+        /* AUX mode — full-screen logo */
+        display_logo(logo_aux);
+
+    } else if (src && src->type == SRC_RADIO) {
+        /* Radio mode — full-screen logo */
+        if (src->logo) {
+            display_logo(src->logo);
+        } else {
+            fb_center_2x(18, src->name);
+        }
+
+        if (!state.playing)
+            fb_center(90, "Connecting...");
+
+    } else if (src && src->type == SRC_DIR) {
+        /* USB mode */
+        char hdr[8];
+        snprintf(hdr, sizeof(hdr), "P%d", state.active_preset + 1);
+        fb_putstr(0, 2, hdr);
+
+        if (state.num_tracks > 0) {
+            char idx[12];
+            snprintf(idx, sizeof(idx), "%d/%d",
+                     state.current_track + 1, state.num_tracks);
+            fb_putstr(SHELBOURNE_FB_WIDTH - (int)strlen(idx) * CHAR_W, 2, idx);
+
+            track_t *t = &state.tracks[state.current_track];
+
+            /* Title in big font (truncate to 10 chars) */
+            char title[BIG_COLS + 1];
+            snprintf(title, sizeof(title), "%.*s", BIG_COLS, t->title);
+            fb_center_2x(18, title);
+
+            if (t->artist[0]) {
+                char line[DISP_COLS + 1];
+                snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->artist);
+                fb_center(40, line);
+            }
+            if (t->album[0]) {
+                char line[DISP_COLS + 1];
+                snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->album);
+                fb_center(50, line);
+            }
+
+            fb_center(66, state.playing ? "Playing" : "Paused");
+        } else {
+            fb_center_2x(18, "No tracks");
+        }
+    }
+
+    if (vol_bar_visible())
+        draw_volume_bar();
+
+    shelbourne_display_flush(state.hw);
 }
 
 /* ── Utility ───────────────────────────────────────────────────── */
@@ -338,7 +531,7 @@ static int ends_with_ci(const char *s, const char *suffix)
     return 1;
 }
 
-/* ── DNS resolver (static binary can't use gethostbyname) ──────── */
+/* ── DNS resolver ──────────────────────────────────────────────── */
 
 static int dns_resolve(const char *hostname, struct in_addr *out)
 {
@@ -590,11 +783,15 @@ static void scan_recursive(const char *dir, int depth)
     closedir(d);
 }
 
-static void scan_usb(const char *dir)
+static void scan_dir(const char *dir)
 {
+    if (state.usb_dir && strcmp(state.usb_dir, dir) == 0)
+        return;  /* already scanned */
+
     state.num_tracks = 0;
     scan_recursive(dir, 0);
 
+    /* Sort by path */
     for (int i = 0; i < state.num_tracks - 1; i++)
         for (int j = i + 1; j < state.num_tracks; j++)
             if (strcmp(state.tracks[i].path, state.tracks[j].path) > 0) {
@@ -603,93 +800,9 @@ static void scan_usb(const char *dir)
                 state.tracks[j] = tmp;
             }
 
-    printf("Found %d MP3 track(s)\n", state.num_tracks);
-    for (int i = 0; i < state.num_tracks; i++) {
-        printf("  %3d. %s", i + 1, state.tracks[i].title);
-        if (state.tracks[i].artist[0])
-            printf(" - %s", state.tracks[i].artist);
-        printf("\n");
-    }
-}
-
-/* ── Display ───────────────────────────────────────────────────── */
-
-static void display_update(void)
-{
-    shelbourne_display_clear(state.hw);
-
-    /* Volume bar at bottom (always visible) */
-    {
-        char vol[8];
-        snprintf(vol, sizeof(vol), "V%d", state.volume);
-        fb_putstr(SHELBOURNE_FB_WIDTH - strlen(vol) * CHAR_W, CHAR_H * 11, vol);
-    }
-
-    if (state.mode == MODE_USB) {
-        fb_putstr(0, 0, "USB");
-        if (state.num_tracks > 0) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%d/%d",
-                     state.current_track + 1, state.num_tracks);
-            fb_putstr(SHELBOURNE_FB_WIDTH - strlen(buf) * CHAR_W, 0, buf);
-        }
-        fb_hline(CHAR_H, 0x40);
-
-        if (state.num_tracks > 0) {
-            track_t *t = &state.tracks[state.current_track];
-            char line[DISP_COLS + 1];
-
-            snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->title);
-            fb_center(CHAR_H * 2, line);
-
-            if (t->artist[0]) {
-                snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->artist);
-                fb_center(CHAR_H * 4, line);
-            }
-            if (t->album[0]) {
-                snprintf(line, sizeof(line), "%.*s", DISP_COLS, t->album);
-                fb_center(CHAR_H * 6, line);
-            }
-        } else {
-            fb_center(CHAR_H * 4, "No tracks");
-        }
-
-        fb_center(CHAR_H * 9, state.playing ? "> Playing" : "Stopped");
-
-    } else if (state.mode == MODE_RADIO) {
-        fb_putstr(0, 0, "RADIO");
-        char buf[8];
-        snprintf(buf, sizeof(buf), "P%d", state.current_station + 1);
-        fb_putstr(SHELBOURNE_FB_WIDTH - strlen(buf) * CHAR_W, 0, buf);
-        fb_hline(CHAR_H, 0x40);
-
-        fb_center(CHAR_H * 3, radio_stations[state.current_station].name);
-        fb_center(CHAR_H * 6, state.playing ? "Streaming..." : "Stopped");
-
-        uint8_t *fb = shelbourne_display_buffer(state.hw);
-        if (fb) {
-            for (int i = 0; i < (int)NUM_STATIONS && i < 6; i++) {
-                char p[4];
-                snprintf(p, sizeof(p), "%d", i + 1);
-                int x = i * (SHELBOURNE_FB_WIDTH / 6) + 4;
-                if (i == state.current_station) {
-                    for (int r = CHAR_H * 10 - 1; r < CHAR_H * 11 + 1; r++)
-                        for (int xx = x - 2; xx < x + CHAR_W + 1 && xx < SHELBOURNE_FB_WIDTH; xx++)
-                            if (r >= 0 && r < SHELBOURNE_FB_HEIGHT && xx >= 0)
-                                fb[r * SHELBOURNE_FB_WIDTH + xx] = 0x60;
-                }
-                fb_putstr(x, CHAR_H * 10, p);
-            }
-        }
-
-    } else if (state.mode == MODE_AUX) {
-        fb_putstr(0, 0, "AUX");
-        fb_hline(CHAR_H, 0x40);
-        fb_center(CHAR_H * 4, "AUX Input");
-        fb_center(CHAR_H * 6, "Listening...");
-    }
-
-    shelbourne_display_flush(state.hw);
+    state.usb_dir = dir;
+    state.current_track = 0;
+    printf("Found %d MP3 track(s) in %s\n", state.num_tracks, dir);
 }
 
 /* ── Keypad ────────────────────────────────────────────────────── */
@@ -708,205 +821,163 @@ static void keypad_poll(void)
             break;
         case SHELBOURNE_KEY_VOLUME_UP:
             if (state.volume < 100) {
-                state.volume += 5;
+                state.volume += VOL_STEP;
+                if (state.volume > 100) state.volume = 100;
                 state.vol_gain = shelbourne_volume_to_gain(state.volume);
-                printf("Volume: %d\n", state.volume);
+                clock_gettime(CLOCK_MONOTONIC, &state.vol_changed_at);
+                state.vol_bar_active = 1;
                 state.display_dirty = 1;
+                printf("Volume: %d\n", state.volume);
             }
             break;
         case SHELBOURNE_KEY_VOLUME_DOWN:
-            if (state.volume > 0) {
-                state.volume -= 5;
+            if (state.volume > MIN_VOL) {
+                state.volume -= VOL_STEP;
+                if (state.volume < MIN_VOL) state.volume = MIN_VOL;
                 state.vol_gain = shelbourne_volume_to_gain(state.volume);
-                printf("Volume: %d\n", state.volume);
+                clock_gettime(CLOCK_MONOTONIC, &state.vol_changed_at);
+                state.vol_bar_active = 1;
                 state.display_dirty = 1;
+                printf("Volume: %d\n", state.volume);
             }
             break;
-        case SHELBOURNE_KEY_PRESET_1: state.cmd_station = 0; break;
-        case SHELBOURNE_KEY_PRESET_2: state.cmd_station = 1; break;
-        case SHELBOURNE_KEY_PRESET_3: state.cmd_station = 2; break;
-        case SHELBOURNE_KEY_PRESET_4: state.cmd_station = 3; break;
-        case SHELBOURNE_KEY_PRESET_5: state.cmd_station = 4; break;
-        case SHELBOURNE_KEY_PRESET_6: state.cmd_station = 5; break;
+        case SHELBOURNE_KEY_PRESET_1: state.cmd_preset = 0; break;
+        case SHELBOURNE_KEY_PRESET_2: state.cmd_preset = 1; break;
+        case SHELBOURNE_KEY_PRESET_3: state.cmd_preset = 2; break;
+        case SHELBOURNE_KEY_PRESET_4: state.cmd_preset = 3; break;
+        case SHELBOURNE_KEY_PRESET_5: state.cmd_preset = 4; break;
+        case SHELBOURNE_KEY_PRESET_6: state.cmd_preset = 5; break;
         case SHELBOURNE_KEY_AUX:
-            if (state.mode == MODE_AUX)
-                state.cmd_mode_switch = 1;  /* exit AUX */
-            else
-                state.cmd_aux = 1;          /* enter AUX */
+            state.cmd_aux = 1;
             break;
         default:
             break;
         }
     }
-}
 
-/* ── LEDs ──────────────────────────────────────────────────────── */
-
-static void leds_update(void)
-{
-    if (state.playing) {
-        if (state.mode == MODE_USB)
-            shelbourne_led_set(state.hw, SHELBOURNE_LED_WHITE);
-        else
-            shelbourne_led_set(state.hw, SHELBOURNE_LED_YELLOW);
-    } else {
-        shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
+    /* Auto-hide volume bar */
+    if (state.vol_bar_active && !vol_bar_visible()) {
+        state.display_dirty = 1;
     }
 }
 
-/* ── USB playback ──────────────────────────────────────────────── */
+/* ── Interrupt check macro ─────────────────────────────────────── */
 
-static void play_usb_track(void)
-{
-    if (state.num_tracks == 0) return;
-
-    track_t *t = &state.tracks[state.current_track];
-    printf("[%d/%d] %s\n", state.current_track + 1, state.num_tracks,
-           t->title);
-    display_update();
-    leds_update();
-
-    FILE *f = fopen(t->path, "rb");
-    if (!f) {
-        fprintf(stderr, "Cannot open %s\n", t->path);
-        return;
-    }
-
-    mp3dec_t mp3d;
-    mp3dec_init(&mp3d);
-    audio_reset();
-
-    uint8_t file_buf[MP3_BUF_SIZE * 2];
-    int buf_fill = 0;
-    state.playing = 1;
-    display_update();
-    leds_update();
-
-    while (!state.cmd_quit && !state.cmd_next && !state.cmd_prev &&
-           !state.cmd_mode_switch && !state.cmd_aux && state.cmd_station < 0) {
-
-        /* Handle pause */
-        while (state.cmd_pause) {
-            state.cmd_pause = 0;
-            state.playing = 0;
-            printf("Paused\n");
-            display_update();
-            leds_update();
-            while (!state.cmd_pause && !state.cmd_quit && !state.cmd_next &&
-                   !state.cmd_prev && !state.cmd_mode_switch &&
-                   !state.cmd_aux && state.cmd_station < 0) {
-                usleep(50000);
-                keypad_poll();
-            }
-            if (state.cmd_pause) {
-                state.cmd_pause = 0;
-                state.playing = 1;
-                printf("Playing\n");
-                audio_reset();
-                display_update();
-                leds_update();
-            }
-        }
-        if (state.cmd_quit || state.cmd_next || state.cmd_prev ||
-            state.cmd_mode_switch || state.cmd_aux || state.cmd_station >= 0) break;
-
-        /* Refill buffer from file */
-        if (buf_fill < MP3_BUF_SIZE) {
-            int n = fread(file_buf + buf_fill, 1,
-                          sizeof(file_buf) - buf_fill, f);
-            if (n <= 0) break;
-            buf_fill += n;
-        }
-
-        /* Decode frame */
-        mp3dec_frame_info_t info;
-        mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-
-        int samples = mp3dec_decode_frame(&mp3d,
-            file_buf, buf_fill, pcm, &info);
-
-        if (info.frame_bytes == 0) break;
-
-        buf_fill -= info.frame_bytes;
-        memmove(file_buf, file_buf + info.frame_bytes, buf_fill);
-
-        if (samples > 0 && info.hz > 0) {
-            if (convert_and_write(pcm, samples, info.channels, info.hz) < 0)
-                break;
-        }
-
-        shelbourne_audio_wait(state.hw);
-        keypad_poll();
-    }
-
-    shelbourne_audio_drain(state.hw);
-    fclose(f);
-    state.playing = 0;
-    state.display_dirty = 0;
-    display_update();
-    leds_update();
-}
+#define INTERRUPTED() \
+    (state.cmd_quit || state.cmd_aux || state.cmd_preset >= 0)
 
 /* ── Radio streaming ───────────────────────────────────────────── */
 
-static int radio_connect(const radio_station_t *st)
+static int radio_connect(const source_t *src)
 {
-    struct in_addr resolved;
-    if (dns_resolve(st->host, &resolved) < 0) {
-        fprintf(stderr, "DNS lookup failed for %s\n", st->host);
-        return -1;
-    }
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(st->port);
-    addr.sin_addr = resolved;
+    char host[256], path[512];
+    int port;
+    strncpy(host, src->host, sizeof(host) - 1); host[sizeof(host) - 1] = '\0';
+    strncpy(path, src->path, sizeof(path) - 1); path[sizeof(path) - 1] = '\0';
+    port = src->port;
 
     struct timeval tv = {.tv_sec = 10};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "Connect to %s:%d failed: %s\n",
-                st->host, st->port, strerror(errno));
+    for (int redirects = 0; redirects < 5; redirects++) {
+        struct in_addr resolved;
+        if (dns_resolve(host, &resolved) < 0) {
+            fprintf(stderr, "DNS lookup failed for %s\n", host);
+            return -1;
+        }
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr = resolved;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "Connect to %s:%d failed: %s\n",
+                    host, port, strerror(errno));
+            close(fd);
+            return -1;
+        }
+
+        char req[1024];
+        int len = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.0\r\n"
+            "Host: %s\r\n"
+            "User-Agent: ShelbournePlayer/1.0\r\n"
+            "Accept: */*\r\n"
+            "\r\n",
+            path, host);
+
+        if (send(fd, req, len, 0) != len) { close(fd); return -1; }
+
+        /* Read HTTP headers */
+        char hdr[4096];
+        int hlen = 0;
+        while (hlen < (int)sizeof(hdr) - 1) {
+            char c;
+            if (recv(fd, &c, 1, 0) != 1) break;
+            hdr[hlen++] = c;
+            if (hlen >= 4 &&
+                hdr[hlen-4] == '\r' && hdr[hlen-3] == '\n' &&
+                hdr[hlen-2] == '\r' && hdr[hlen-1] == '\n')
+                break;
+        }
+        hdr[hlen] = '\0';
+
+        /* Check for redirect */
+        if (!strstr(hdr, " 301") && !strstr(hdr, " 302")) {
+            printf("Radio connected: %s\n", src->name);
+            return fd;
+        }
+
+        char *loc = strstr(hdr, "Location: ");
+        if (!loc) loc = strstr(hdr, "location: ");
+        if (!loc) {
+            printf("Radio connected: %s\n", src->name);
+            return fd;
+        }
+        loc += 10;
+        char *end = strstr(loc, "\r\n");
+        if (end) *end = '\0';
+        printf("Redirect: %s\n", loc);
         close(fd);
-        return -1;
+
+        if (loc[0] == '/') {
+            /* Relative redirect — same host, new path */
+            strncpy(path, loc, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        } else {
+            /* Absolute redirect — parse host/port/path */
+            if (strncmp(loc, "http://", 7) == 0) { loc += 7; port = 80; }
+            else if (strncmp(loc, "https://", 8) == 0) { loc += 8; port = 443; }
+            else port = 80;
+
+            char *slash = strchr(loc, '/');
+            if (slash) {
+                strncpy(path, slash, sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+                *slash = '\0';
+            } else {
+                strcpy(path, "/");
+            }
+            char *colon = strchr(loc, ':');
+            if (colon) {
+                *colon = '\0';
+                port = atoi(colon + 1);
+            }
+            strncpy(host, loc, sizeof(host) - 1);
+            host[sizeof(host) - 1] = '\0';
+        }
     }
 
-    char req[512];
-    int len = snprintf(req, sizeof(req),
-        "GET %s HTTP/1.0\r\n"
-        "Host: %s\r\n"
-        "User-Agent: ShelbournePlayer/1.0\r\n"
-        "Accept: */*\r\n"
-        "\r\n",
-        st->path, st->host);
-
-    if (send(fd, req, len, 0) != len) {
-        close(fd);
-        return -1;
-    }
-
-    char hdr[4096];
-    int hlen = 0;
-    while (hlen < (int)sizeof(hdr) - 1) {
-        char c;
-        if (recv(fd, &c, 1, 0) != 1) break;
-        hdr[hlen++] = c;
-        if (hlen >= 4 &&
-            hdr[hlen-4] == '\r' && hdr[hlen-3] == '\n' &&
-            hdr[hlen-2] == '\r' && hdr[hlen-1] == '\n')
-            break;
-    }
-
-    printf("Radio connected: %s\n", st->name);
-    return fd;
+    fprintf(stderr, "Too many redirects for %s\n", src->name);
+    return -1;
 }
 
-static void play_radio(void)
+static void play_radio(const source_t *src)
 {
     mp3dec_t mp3d;
     mp3dec_init(&mp3d);
@@ -914,23 +985,17 @@ static void play_radio(void)
     uint8_t stream_buf[MP3_BUF_SIZE * 2];
     int buf_fill = 0;
 
-    while (!state.cmd_quit && !state.cmd_mode_switch && !state.cmd_aux) {
-        const radio_station_t *st = &radio_stations[state.current_station];
-        printf("Connecting to %s...\n", st->name);
+    while (!state.cmd_quit && !state.cmd_aux && state.cmd_preset < 0) {
+        printf("Connecting to %s...\n", src->name);
         display_update();
 
-        int sock = radio_connect(st);
+        int sock = radio_connect(src);
         if (sock < 0) {
             fprintf(stderr, "Failed, retrying in 3s...\n");
-            shelbourne_led_set(state.hw, SHELBOURNE_LED_YELLOW);
-            sleep(3);
-            shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
-
-            if (state.cmd_station >= 0) {
-                state.current_station = state.cmd_station;
-                state.cmd_station = -1;
+            for (int w = 0; w < 30 && !INTERRUPTED(); w++) {
+                usleep(100000);
+                keypad_poll();
             }
-            keypad_poll();
             continue;
         }
 
@@ -951,98 +1016,85 @@ static void play_radio(void)
                 buf_fill += n;
             }
         }
-        printf("Buffered %d bytes, starting playback\n", buf_fill);
-
+        printf("Buffered %d bytes\n", buf_fill);
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
 
         state.playing = 1;
         display_update();
-        leds_update();
 
-        while (!state.cmd_quit && !state.cmd_mode_switch && !state.cmd_aux &&
-               state.cmd_station < 0 && !state.cmd_next && !state.cmd_prev) {
-
+        while (!INTERRUPTED()) {
             keypad_poll();
 
             /* Handle pause */
-            while (state.cmd_pause) {
+            while (state.cmd_pause && !INTERRUPTED()) {
                 state.cmd_pause = 0;
                 state.playing = 0;
-                printf("Radio paused\n");
                 display_update();
-                leds_update();
-                while (!state.cmd_pause && !state.cmd_quit &&
-                       !state.cmd_mode_switch && !state.cmd_aux &&
-                       state.cmd_station < 0 &&
-                       !state.cmd_next && !state.cmd_prev) {
+                while (!state.cmd_pause && !INTERRUPTED()) {
                     usleep(50000);
                     keypad_poll();
+                    if (state.display_dirty) {
+                        state.display_dirty = 0;
+                        display_update();
+                    }
                 }
                 if (state.cmd_pause) {
                     state.cmd_pause = 0;
                     state.playing = 1;
-                    printf("Radio playing\n");
                     audio_reset();
                     display_update();
-                    leds_update();
                 }
             }
-            if (state.cmd_quit || state.cmd_mode_switch || state.cmd_aux ||
-                state.cmd_station >= 0 || state.cmd_next || state.cmd_prev)
-                break;
+            if (INTERRUPTED()) break;
 
-            /* Top up buffer from network */
+            /* Top up buffer */
             if (buf_fill < (int)sizeof(stream_buf)) {
                 int n = recv(sock, stream_buf + buf_fill,
                              sizeof(stream_buf) - buf_fill, 0);
                 if (n > 0) {
                     buf_fill += n;
                 } else if (n == 0) {
-                    fprintf(stderr, "Stream ended, reconnecting...\n");
+                    fprintf(stderr, "Stream ended\n");
                     break;
                 } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    fprintf(stderr, "Stream error: %s, reconnecting...\n",
-                            strerror(errno));
+                    fprintf(stderr, "Stream error: %s\n", strerror(errno));
                     break;
                 }
             }
 
-            /* Decode all available frames */
-            {
-                mp3dec_frame_info_t info;
-                mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+            /* Decode frames */
+            mp3dec_frame_info_t info;
+            mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
-                while (buf_fill >= 4 &&
-                       !state.cmd_quit && !state.cmd_mode_switch &&
-                       !state.cmd_aux && state.cmd_station < 0 &&
-                       !state.cmd_next && !state.cmd_prev &&
-                       !state.cmd_pause) {
+            while (buf_fill >= 4 && !INTERRUPTED() && !state.cmd_pause) {
+                int samples = mp3dec_decode_frame(&mp3d,
+                    stream_buf, buf_fill, pcm, &info);
 
-                    int samples = mp3dec_decode_frame(&mp3d,
-                        stream_buf, buf_fill, pcm, &info);
+                if (info.frame_bytes > 0) {
+                    buf_fill -= info.frame_bytes;
+                    memmove(stream_buf, stream_buf + info.frame_bytes, buf_fill);
 
-                    if (info.frame_bytes > 0) {
-                        buf_fill -= info.frame_bytes;
-                        memmove(stream_buf, stream_buf + info.frame_bytes, buf_fill);
+                    if (samples > 0 && info.hz > 0)
+                        convert_and_write(pcm, samples, info.channels, info.hz);
 
-                        if (samples > 0 && info.hz > 0)
-                            convert_and_write(pcm, samples, info.channels, info.hz);
+                    shelbourne_audio_wait(state.hw);
 
-                        shelbourne_audio_wait(state.hw);
-
-                        /* Top up network buffer between frames */
-                        if (buf_fill < MP3_BUF_SIZE) {
-                            int n = recv(sock, stream_buf + buf_fill,
-                                         sizeof(stream_buf) - buf_fill, 0);
-                            if (n > 0) buf_fill += n;
-                        }
-                        keypad_poll();
-                    } else if (buf_fill > MP3_BUF_SIZE) {
-                        memmove(stream_buf, stream_buf + 1, buf_fill - 1);
-                        buf_fill--;
-                    } else {
-                        break;
+                    if (buf_fill < MP3_BUF_SIZE) {
+                        int n = recv(sock, stream_buf + buf_fill,
+                                     sizeof(stream_buf) - buf_fill, 0);
+                        if (n > 0) buf_fill += n;
                     }
+
+                    keypad_poll();
+                    if (state.display_dirty) {
+                        state.display_dirty = 0;
+                        display_update();
+                    }
+                } else if (buf_fill > MP3_BUF_SIZE) {
+                    memmove(stream_buf, stream_buf + 1, buf_fill - 1);
+                    buf_fill--;
+                } else {
+                    break;
                 }
             }
         }
@@ -1050,22 +1102,113 @@ static void play_radio(void)
         close(sock);
         state.radio_fd = -1;
         state.playing = 0;
+    }
+}
 
-        if (state.cmd_station >= 0) {
-            state.current_station = state.cmd_station;
-            state.cmd_station = -1;
-        } else if (state.cmd_next) {
-            state.current_station = (state.current_station + 1) % NUM_STATIONS;
-            state.cmd_next = 0;
-        } else if (state.cmd_prev) {
-            state.current_station = (state.current_station + NUM_STATIONS - 1) % NUM_STATIONS;
-            state.cmd_prev = 0;
+/* ── USB playback ──────────────────────────────────────────────── */
+
+static void play_usb(const source_t *src)
+{
+    scan_dir(src->dir);
+
+    while (!INTERRUPTED() && state.num_tracks > 0) {
+        track_t *t = &state.tracks[state.current_track];
+        printf("[%d/%d] %s\n", state.current_track + 1, state.num_tracks,
+               t->title);
+
+        state.playing = 1;
+        display_update();
+
+        FILE *f = fopen(t->path, "rb");
+        if (!f) {
+            fprintf(stderr, "Cannot open %s\n", t->path);
+            state.current_track = (state.current_track + 1) % state.num_tracks;
+            continue;
+        }
+
+        mp3dec_t mp3d;
+        mp3dec_init(&mp3d);
+        audio_reset();
+
+        uint8_t file_buf[MP3_BUF_SIZE * 2];
+        int buf_fill = 0;
+
+        while (!INTERRUPTED()) {
+            /* Handle pause */
+            while (state.cmd_pause && !INTERRUPTED()) {
+                state.cmd_pause = 0;
+                state.playing = 0;
+                display_update();
+                while (!state.cmd_pause && !INTERRUPTED()) {
+                    usleep(50000);
+                    keypad_poll();
+                    if (state.display_dirty) {
+                        state.display_dirty = 0;
+                        display_update();
+                    }
+                }
+                if (state.cmd_pause) {
+                    state.cmd_pause = 0;
+                    state.playing = 1;
+                    audio_reset();
+                    display_update();
+                }
+            }
+            if (INTERRUPTED()) break;
+
+            /* Refill buffer */
+            if (buf_fill < MP3_BUF_SIZE) {
+                int n = fread(file_buf + buf_fill, 1,
+                              sizeof(file_buf) - buf_fill, f);
+                if (n <= 0) break;  /* end of track */
+                buf_fill += n;
+            }
+
+            /* Decode */
+            mp3dec_frame_info_t info;
+            mp3d_sample_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+
+            int samples = mp3dec_decode_frame(&mp3d,
+                file_buf, buf_fill, pcm, &info);
+
+            if (info.frame_bytes == 0) break;
+
+            buf_fill -= info.frame_bytes;
+            memmove(file_buf, file_buf + info.frame_bytes, buf_fill);
+
+            if (samples > 0 && info.hz > 0)
+                convert_and_write(pcm, samples, info.channels, info.hz);
+
+            shelbourne_audio_wait(state.hw);
+            keypad_poll();
+
+            if (state.display_dirty) {
+                state.display_dirty = 0;
+                display_update();
+            }
+        }
+
+        shelbourne_audio_drain(state.hw);
+        fclose(f);
+        state.playing = 0;
+
+        if (!INTERRUPTED()) {
+            /* Advance to next track */
+            state.current_track = (state.current_track + 1) % state.num_tracks;
         }
     }
 
-    state.playing = 0;
-    leds_update();
-    display_update();
+    if (state.num_tracks == 0) {
+        display_update();
+        while (!INTERRUPTED()) {
+            usleep(100000);
+            keypad_poll();
+            if (state.display_dirty) {
+                state.display_dirty = 0;
+                display_update();
+            }
+        }
+    }
 }
 
 /* ── AUX loopback ──────────────────────────────────────────────── */
@@ -1081,36 +1224,34 @@ static void play_aux(void)
 
     state.playing = 1;
     display_update();
-    leds_update();
 
-    while (!state.cmd_quit && !state.cmd_mode_switch && state.cmd_station < 0) {
+    while (!state.cmd_quit && state.cmd_preset < 0) {
         if (shelbourne_aux_pump(state.hw, state.vol_gain) < 0) {
             fprintf(stderr, "AUX pump error\n");
             break;
         }
         keypad_poll();
 
-        /* Update display if volume changed */
-        if (state.display_dirty) {
-            state.display_dirty = 0;
-            display_update();
-        }
-
         if (state.cmd_pause) {
             state.cmd_pause = 0;
-            /* In AUX mode, pause = mute toggle */
             static int aux_muted = 0;
             aux_muted = !aux_muted;
             shelbourne_mute(state.hw, aux_muted);
             printf("AUX %s\n", aux_muted ? "muted" : "unmuted");
         }
+
+        if (state.display_dirty) {
+            state.display_dirty = 0;
+            display_update();
+        }
+
+        /* AUX button while in AUX = no-op (already in AUX) */
+        if (state.cmd_aux) state.cmd_aux = 0;
     }
 
     shelbourne_aux_disable(state.hw);
     state.playing = 0;
     printf("Left AUX mode\n");
-    leds_update();
-    display_update();
 }
 
 /* ── Signal handling ───────────────────────────────────────────── */
@@ -1125,16 +1266,14 @@ static void sig_handler(int sig)
 
 int main(int argc, char *argv[])
 {
-    const char *media_dir = "/media/sda1";
-    if (argc > 1) media_dir = argv[1];
+    (void)argc; (void)argv;
 
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
     memset(&state, 0, sizeof(state));
-    state.mode = MODE_USB;
-    state.prev_mode = MODE_USB;
-    state.cmd_station = -1;
+    state.active_preset = 0;   /* start on preset 1 */
+    state.cmd_preset = -1;
     state.radio_fd = -1;
     state.volume = DEFAULT_VOL;
     state.vol_gain = shelbourne_volume_to_gain(DEFAULT_VOL);
@@ -1150,95 +1289,63 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* LED always off */
+    shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
+
     /* Startup screen */
     shelbourne_display_clear(state.hw);
-    fb_center(CHAR_H * 4, "Starting...");
+    fb_center_2x(20, "Starting");
     shelbourne_display_flush(state.hw);
-
-    /* Scan USB */
-    scan_usb(media_dir);
-
-    /* Initial mode */
-    if (state.num_tracks > 0)
-        state.mode = MODE_USB;
-    else
-        state.mode = MODE_RADIO;
 
     /* Main loop */
     while (!state.cmd_quit) {
-        if (state.mode == MODE_USB) {
-            if (state.num_tracks > 0) {
-                play_usb_track();
+        const source_t *src = active_source();
 
-                if (!state.cmd_quit && !state.cmd_next && !state.cmd_prev &&
-                    !state.cmd_mode_switch && !state.cmd_aux &&
-                    state.cmd_station < 0) {
-                    state.current_track++;
-                    if (state.current_track >= state.num_tracks)
-                        state.current_track = 0;
-                }
-            } else {
-                display_update();
+        if (state.active_preset < 0) {
+            play_aux();
+        } else if (src && src->type == SRC_RADIO) {
+            play_radio(src);
+        } else if (src && src->type == SRC_DIR) {
+            play_usb(src);
+        } else {
+            /* Empty preset or no source — wait for input */
+            display_update();
+            while (!INTERRUPTED() && !state.cmd_aux) {
                 usleep(100000);
                 keypad_poll();
             }
-
-            if (state.cmd_next) {
-                state.cmd_next = 0;
-                state.current_track = (state.current_track + 1) %
-                                       state.num_tracks;
-            }
-            if (state.cmd_prev) {
-                state.cmd_prev = 0;
-                state.current_track = (state.current_track +
-                                        state.num_tracks - 1) %
-                                       state.num_tracks;
-            }
-        } else if (state.mode == MODE_RADIO) {
-            play_radio();
-        } else if (state.mode == MODE_AUX) {
-            play_aux();
         }
 
-        /* Handle AUX toggle */
+        /* Handle AUX */
         if (state.cmd_aux) {
             state.cmd_aux = 0;
-            state.prev_mode = state.mode;
-            state.mode = MODE_AUX;
-            display_update();
-            leds_update();
+            state.active_preset = -1;
         }
 
-        /* Handle mode switch (leaving AUX) */
-        if (state.cmd_mode_switch) {
-            state.cmd_mode_switch = 0;
-            if (state.mode == MODE_AUX) {
-                state.mode = state.prev_mode;
-            } else if (state.mode == MODE_USB && NUM_STATIONS > 0) {
-                state.mode = MODE_RADIO;
-            } else if (state.mode == MODE_RADIO && state.num_tracks > 0) {
-                state.mode = MODE_USB;
-            }
-            display_update();
-            leds_update();
-        }
+        /* Handle preset */
+        if (state.cmd_preset >= 0) {
+            int p = state.cmd_preset;
+            state.cmd_preset = -1;
 
-        /* Handle station presets (always switch to radio) */
-        if (state.cmd_station >= 0) {
-            int st = state.cmd_station;
-            state.cmd_station = -1;
-            if (st < (int)NUM_STATIONS) {
-                state.mode = MODE_RADIO;
-                state.current_station = st;
+            if (p < NUM_PRESETS && presets[p].num_sources > 0) {
+                if (p == state.active_preset) {
+                    /* Same preset — cycle source */
+                    presets[p].current =
+                        (presets[p].current + 1) % presets[p].num_sources;
+                    printf("Preset %d: source %d/%d (%s)\n",
+                           p + 1, presets[p].current + 1,
+                           presets[p].num_sources,
+                           presets[p].sources[presets[p].current].name);
+                }
+                state.active_preset = p;
             }
         }
     }
 
     /* Cleanup */
     printf("\nShutting down...\n");
-
     shelbourne_display_clear(state.hw);
-    fb_center(CHAR_H * 4, "Goodbye");
+    fb_center_2x(20, "Goodbye");
     shelbourne_display_flush(state.hw);
     sleep(1);
 
