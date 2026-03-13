@@ -19,7 +19,7 @@ all: docker
 	  --platform linux/amd64 $(IMAGE) \
 	  $(CC) $(CFLAGS) -I/libshelbourne \
 	    -o /work/build/player \
-	    /work/player.c /work/net.c /work/display.c \
+	    /work/player.c /work/net.c /work/display.c /work/sun.c \
 	    /libshelbourne/shelbourne.c -lm
 	@echo "Built: build/player"
 

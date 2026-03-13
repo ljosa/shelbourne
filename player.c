@@ -14,6 +14,7 @@
 #include "station_logos.h"
 #include "display.h"
 #include "net.h"
+#include "sun.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -331,22 +332,25 @@ static void display_update(void)
         }
 
     } else {
-        /* Idle — show clock */
-        time_t now = ntp_time();
-        struct tm *tm = localtime(&now);
-        if (tm) {
-            char clk[6];
-            snprintf(clk, sizeof(clk), "%d:%02d", tm->tm_hour, tm->tm_min);
-            fb_center_4x(20, clk);
+        /* Idle — show clock during daytime, blank at night */
+        if (sun_clock_visible(44.48, -73.21)) {
+            time_t now = ntp_time();
+            struct tm *tm = localtime(&now);
+            if (tm) {
+                char clk[6];
+                snprintf(clk, sizeof(clk), "%d:%02d", tm->tm_hour, tm->tm_min);
+                fb_center_4x(20, clk);
 
-            const char *days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-            const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
-            char date[20];
-            snprintf(date, sizeof(date), "%s %s %d",
-                     days[tm->tm_wday], months[tm->tm_mon], tm->tm_mday);
-            fb_center_2x(62, date);
+                const char *days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+                const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                        "Jul","Aug","Sep","Oct","Nov","Dec"};
+                char date[20];
+                snprintf(date, sizeof(date), "%s %s %d",
+                         days[tm->tm_wday], months[tm->tm_mon], tm->tm_mday);
+                fb_center_2x(62, date);
+            }
         }
+        /* else: display stays blank (cleared at top of function) */
     }
 
     if (vol_bar_visible())
