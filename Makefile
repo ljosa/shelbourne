@@ -45,7 +45,7 @@ all: docker
 	    $(CC) $(CFLAGS) -I/libshelbourne \
 	      -o /work/build/player \
 	      /work/player.c /work/net.c /work/display.c /work/sun.c \
-	      /work/airplay.c \
+	      /work/airplay.c /work/displayd.c \
 	      /libshelbourne/shelbourne.c \
 	      -lm -lpthread && \
 	    $(CC) $(CFLAGS) \

@@ -16,6 +16,7 @@
 #include "net.h"
 #include "sun.h"
 #include "airplay.h"
+#include "displayd.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -146,8 +147,6 @@ static struct {
     /* Volume */
     int volume;
     int vol_gain;
-    struct timespec vol_changed_at;
-    int vol_bar_active;
 
     /* Commands */
     volatile int cmd_quit;
@@ -156,20 +155,9 @@ static struct {
     volatile int cmd_preset;  /* 0-5, or -1 for none */
     volatile int cmd_airplay; /* set when AirPlay stream detected */
 
-    /* Display */
-    int display_dirty;          /* immediate refresh (keypress, mode change) */
-    int scroll_dirty;           /* deferred refresh (scroll animation) */
-    long last_scroll_flush_ms;  /* throttle scroll-driven flushes */
+    /* Display process */
+    int display_fd;             /* pipe to display process */
 } state;
-
-#define SCROLL_FLUSH_INTERVAL_MS 300  /* max ~3 fps for scroll updates */
-
-static long player_mono_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
-}
 
 /* ── Resampler ─────────────────────────────────────────────────── */
 
@@ -224,57 +212,6 @@ static int convert_and_write(const mp3d_sample_t *pcm,
     return 0;
 }
 
-/* ── Volume bar ────────────────────────────────────────────────── */
-
-static void draw_volume_bar(void)
-{
-    uint8_t *fb = shelbourne_display_buffer(state.hw);
-    if (!fb) return;
-
-    int bar_y = SHELBOURNE_FB_HEIGHT - 14;
-    int bar_x = 4;
-    int bar_max_w = SHELBOURNE_FB_WIDTH - 32;
-    int fill_w = (state.volume * bar_max_w) / 100;
-
-    /* Clear bar area */
-    for (int y = bar_y; y < SHELBOURNE_FB_HEIGHT; y++)
-        memset(&fb[y * SHELBOURNE_FB_WIDTH], 0, SHELBOURNE_FB_WIDTH);
-
-    /* Outline */
-    for (int x = bar_x; x < bar_x + bar_max_w; x++) {
-        fb[bar_y * SHELBOURNE_FB_WIDTH + x] = 0x30;
-        fb[(SHELBOURNE_FB_HEIGHT - 3) * SHELBOURNE_FB_WIDTH + x] = 0x30;
-    }
-    for (int y = bar_y; y <= SHELBOURNE_FB_HEIGHT - 3; y++) {
-        fb[y * SHELBOURNE_FB_WIDTH + bar_x] = 0x30;
-        fb[y * SHELBOURNE_FB_WIDTH + bar_x + bar_max_w - 1] = 0x30;
-    }
-
-    /* Fill */
-    for (int y = bar_y + 2; y < SHELBOURNE_FB_HEIGHT - 4; y++)
-        for (int x = bar_x + 2; x < bar_x + 2 + fill_w; x++)
-            fb[y * SHELBOURNE_FB_WIDTH + x] = 0xFF;
-
-    /* Volume number */
-    char vol[4];
-    snprintf(vol, sizeof(vol), "%d", state.volume);
-    fb_putstr(SHELBOURNE_FB_WIDTH - fb_text_width(vol) - 2, bar_y + 3, vol);
-}
-
-static int vol_bar_visible(void)
-{
-    if (!state.vol_bar_active) return 0;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long ms = (now.tv_sec - state.vol_changed_at.tv_sec) * 1000L +
-              (now.tv_nsec - state.vol_changed_at.tv_nsec) / 1000000;
-    if (ms >= VOL_BAR_MS) {
-        state.vol_bar_active = 0;
-        return 0;
-    }
-    return 1;
-}
-
 /* ── Display ───────────────────────────────────────────────────── */
 
 static const source_t *active_source(void)
@@ -286,97 +223,53 @@ static const source_t *active_source(void)
     return &p->sources[p->current];
 }
 
-static void display_update(void)
+/*
+ * Send current display state to the display process.
+ * include_volume: if true, show volume bar overlay.
+ */
+static void send_display_msg(int include_volume)
 {
-    shelbourne_display_clear(state.hw);
+    if (state.display_fd < 0) return;
+
+    display_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.volume = include_volume ? state.volume : -1;
+
     const source_t *src = active_source();
 
     if (airplay_is_streaming() && state.playing) {
-        /* AirPlay mode */
-        fb_center_4x(20, "AirPlay");
-
+        msg.mode = DISP_AIRPLAY;
     } else if (state.active_preset < 0) {
-        /* AUX mode — full-screen logo */
-        display_logo(logo_aux);
-
+        msg.mode = DISP_AUX;
+        msg.logo = (uintptr_t)logo_aux;
     } else if (src && (src->type == SRC_RADIO || src->type == SRC_PODCAST)) {
-        /* Radio/podcast — half-height logo + text below */
-        if (!state.playing) {
-            /* Not playing yet — show logo + name (for "connecting" phase) */
-            if (src->logo)
-                display_logo(src->logo);
-            fb_center_2x(54, src->name);
-        } else if (src->type == SRC_PODCAST) {
-            /* Podcast — logo + name + date */
-            if (src->logo)
-                display_logo(src->logo);
-            fb_center_2x(54, src->name);
-            if (state.podcast_date[0])
-                fb_center_2x(74, state.podcast_date);
-        } else if (state.stream_title[0]) {
-            /* Radio with ICY metadata — logo + scrolling title */
-            if (src->logo)
-                display_logo(src->logo);
-            if (fb_scroll_2x(54, state.stream_title))
-                state.scroll_dirty = 1;
+        msg.logo = (uintptr_t)src->logo;
+        msg.playing = state.playing;
+        if (src->type == SRC_PODCAST) {
+            msg.mode = DISP_PODCAST;
+            strncpy(msg.text1, src->name, DISP_TEXT_LEN - 1);
+            strncpy(msg.text2, state.podcast_date, DISP_TEXT_LEN - 1);
         } else {
-            /* Radio, no metadata yet — logo + name */
-            if (src->logo)
-                display_logo(src->logo);
-            fb_center_2x(54, src->name);
+            msg.mode = DISP_RADIO;
+            strncpy(msg.text1, src->name, DISP_TEXT_LEN - 1);
+            strncpy(msg.text2, state.stream_title, DISP_TEXT_LEN - 1);
         }
-
     } else if (src && src->type == SRC_DIR) {
-        /* USB mode */
-        if (!state.playing) {
-            /* Paused */
-        } else if (state.num_tracks > 0) {
+        msg.mode = DISP_USB;
+        msg.playing = state.playing;
+        if (state.num_tracks > 0) {
             track_t *t = &state.tracks[state.current_track];
-
-            char idx[16];
-            snprintf(idx, sizeof(idx), "%d/%d",
-                     state.current_track + 1, state.num_tracks);
-            fb_putstr(SHELBOURNE_FB_WIDTH - fb_text_width(idx), 0, idx);
-
-            /* Title — scroll if too long */
-            if (fb_scroll_2x(14, t->title))
-                state.scroll_dirty = 1;
-
-            int y = 14 + 21;  /* below title */
-            if (t->artist[0])
-                y = fb_wrap_2x(y, 70, t->artist);
-            if (t->album[0])
-                fb_wrap_2x(y + 2, 96, t->album);
-        } else {
-            fb_center_2x(18, "No tracks");
+            msg.track_num = state.current_track + 1;
+            msg.track_total = state.num_tracks;
+            strncpy(msg.text1, t->title, DISP_TEXT_LEN - 1);
+            strncpy(msg.text2, t->artist, DISP_TEXT_LEN - 1);
+            strncpy(msg.text3, t->album, DISP_TEXT_LEN - 1);
         }
-
     } else {
-        /* Idle — show clock during daytime, blank at night */
-        if (sun_clock_visible(44.48, -73.21)) {
-            time_t now = ntp_time();
-            struct tm *tm = localtime(&now);
-            if (tm) {
-                char clk[6];
-                snprintf(clk, sizeof(clk), "%d:%02d", tm->tm_hour, tm->tm_min);
-                fb_center_4x(20, clk);
-
-                const char *days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-                const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                        "Jul","Aug","Sep","Oct","Nov","Dec"};
-                char date[20];
-                snprintf(date, sizeof(date), "%s %s %d",
-                         days[tm->tm_wday], months[tm->tm_mon], tm->tm_mday);
-                fb_center_2x(62, date);
-            }
-        }
-        /* else: display stays blank (cleared at top of function) */
+        msg.mode = DISP_CLOCK;
     }
 
-    if (vol_bar_visible())
-        draw_volume_bar();
-
-    shelbourne_display_flush(state.hw);
+    displayd_send(state.display_fd, &msg);
 }
 
 /* ── Utility ───────────────────────────────────────────────────── */
@@ -598,9 +491,7 @@ static void keypad_poll(void)
                 state.volume += VOL_STEP;
                 if (state.volume > 100) state.volume = 100;
                 state.vol_gain = shelbourne_volume_to_gain(state.volume);
-                clock_gettime(CLOCK_MONOTONIC, &state.vol_changed_at);
-                state.vol_bar_active = 1;
-                state.display_dirty = 1;
+                send_display_msg(1);
                 printf("Volume: %d\n", state.volume);
             }
             break;
@@ -609,9 +500,7 @@ static void keypad_poll(void)
                 state.volume -= VOL_STEP;
                 if (state.volume < MIN_VOL) state.volume = MIN_VOL;
                 state.vol_gain = shelbourne_volume_to_gain(state.volume);
-                clock_gettime(CLOCK_MONOTONIC, &state.vol_changed_at);
-                state.vol_bar_active = 1;
-                state.display_dirty = 1;
+                send_display_msg(1);
                 printf("Volume: %d\n", state.volume);
             }
             break;
@@ -627,11 +516,6 @@ static void keypad_poll(void)
         default:
             break;
         }
-    }
-
-    /* Auto-hide volume bar */
-    if (state.vol_bar_active && !vol_bar_visible()) {
-        state.display_dirty = 1;
     }
 
     /* Detect incoming AirPlay stream */
@@ -786,7 +670,7 @@ static void parse_icy_metadata(const char *meta, int meta_len)
     memcpy(state.stream_title, p, len);
     state.stream_title[len] = '\0';
     printf("ICY title: %s\n", state.stream_title);
-    state.display_dirty = 1;
+    send_display_msg(0);
 }
 
 static int recv_exact(int fd, void *buf, int len)
@@ -856,7 +740,7 @@ static void play_radio(const source_t *src)
         /* Show logo + name immediately (before slow connect) */
         printf("Connecting to %s...\n", src->name);
         state.stream_title[0] = '\0';
-        display_update();
+        send_display_msg(0);
 
         int sock = radio_connect(src);
         if (sock < 0) {
@@ -888,7 +772,7 @@ static void play_radio(const source_t *src)
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
 
         state.playing = 1;
-        display_update();
+        send_display_msg(0);
 
         while (!INTERRUPTED()) {
             keypad_poll();
@@ -932,20 +816,6 @@ static void play_radio(const source_t *src)
                     }
 
                     keypad_poll();
-
-                    if (state.display_dirty) {
-                        state.display_dirty = 0;
-                        state.scroll_dirty = 0;
-                        display_update();
-                        state.last_scroll_flush_ms = player_mono_ms();
-                    } else if (state.scroll_dirty) {
-                        long now = player_mono_ms();
-                        if (now - state.last_scroll_flush_ms >= SCROLL_FLUSH_INTERVAL_MS) {
-                            state.scroll_dirty = 0;
-                            display_update();
-                            state.last_scroll_flush_ms = now;
-                        }
-                    }
                 } else if (buf_fill > MP3_BUF_SIZE) {
                     memmove(stream_buf, stream_buf + 1, buf_fill - 1);
                     buf_fill--;
@@ -973,7 +843,7 @@ static void play_usb(const source_t *src)
                t->title);
 
         state.playing = 1;
-        display_update();
+        send_display_msg(0);
 
         FILE *f = fopen(t->path, "rb");
         if (!f) {
@@ -1015,20 +885,6 @@ static void play_usb(const source_t *src)
 
             shelbourne_audio_wait(state.hw);
             keypad_poll();
-
-            if (state.display_dirty) {
-                state.display_dirty = 0;
-                state.scroll_dirty = 0;
-                display_update();
-                state.last_scroll_flush_ms = player_mono_ms();
-            } else if (state.scroll_dirty) {
-                long now = player_mono_ms();
-                if (now - state.last_scroll_flush_ms >= SCROLL_FLUSH_INTERVAL_MS) {
-                    state.scroll_dirty = 0;
-                    display_update();
-                    state.last_scroll_flush_ms = now;
-                }
-            }
         }
 
         shelbourne_audio_drain(state.hw);
@@ -1042,14 +898,10 @@ static void play_usb(const source_t *src)
     }
 
     if (state.num_tracks == 0) {
-        display_update();
+        send_display_msg(0);
         while (!INTERRUPTED()) {
             usleep(100000);
             keypad_poll();
-            if (state.display_dirty) {
-                state.display_dirty = 0;
-                display_update();
-            }
         }
     }
 }
@@ -1066,7 +918,7 @@ static void play_aux(void)
     }
 
     state.playing = 1;
-    display_update();
+    send_display_msg(0);
 
     while (!state.cmd_quit && state.cmd_preset < 0 && !state.cmd_off) {
         if (shelbourne_aux_pump(state.hw, state.vol_gain) < 0) {
@@ -1074,11 +926,6 @@ static void play_aux(void)
             break;
         }
         keypad_poll();
-
-        if (state.display_dirty) {
-            state.display_dirty = 0;
-            display_update();
-        }
 
         /* AUX button while in AUX = no-op (already in AUX) */
         if (state.cmd_aux) state.cmd_aux = 0;
@@ -1210,12 +1057,12 @@ static void play_podcast(const source_t *src)
 {
     /* Show logo immediately */
     state.podcast_date[0] = '\0';
-    display_update();
+    send_display_msg(0);
 
     printf("Fetching podcast feed...\n");
     if (podcast_fetch_latest(src) < 0) {
         fprintf(stderr, "Failed to fetch podcast feed\n");
-        display_update();
+        send_display_msg(0);
         for (int w = 0; w < 50 && !INTERRUPTED(); w++) {
             usleep(100000);
             keypad_poll();
@@ -1223,7 +1070,7 @@ static void play_podcast(const source_t *src)
         return;
     }
 
-    display_update();  /* show date */
+    send_display_msg(0);  /* show date */
 
     int sock = podcast_connect();
     if (sock < 0) {
@@ -1258,7 +1105,7 @@ static void play_podcast(const source_t *src)
     fcntl(sock, F_SETFL, fcntl(sock, F_GETFL) | O_NONBLOCK);
 
     state.playing = 1;
-    display_update();
+    send_display_msg(0);
 
     int stream_ended = 0;
 
@@ -1305,11 +1152,6 @@ static void play_podcast(const source_t *src)
                 }
 
                 keypad_poll();
-
-                if (state.display_dirty) {
-                    state.display_dirty = 0;
-                    display_update();
-                }
             } else if (buf_fill > MP3_BUF_SIZE) {
                 memmove(stream_buf, stream_buf + 1, buf_fill - 1);
                 buf_fill--;
@@ -1340,7 +1182,7 @@ static void play_airplay(void)
 {
     printf("Entering AirPlay mode\n");
     state.playing = 1;
-    display_update();
+    send_display_msg(0);
 
     audio_reset();
 
@@ -1367,11 +1209,6 @@ static void play_airplay(void)
         }
 
         keypad_poll();
-
-        if (state.display_dirty) {
-            state.display_dirty = 0;
-            display_update();
-        }
     }
 
     shelbourne_audio_drain(state.hw);
@@ -1402,6 +1239,7 @@ int main(int argc, char *argv[])
     state.active_preset = NUM_PRESETS;  /* idle — no source selected */
     state.cmd_preset = -1;
     state.radio_fd = -1;
+    state.display_fd = -1;
     state.volume = DEFAULT_VOL;
     state.vol_gain = shelbourne_volume_to_gain(DEFAULT_VOL);
 
@@ -1429,13 +1267,14 @@ int main(int argc, char *argv[])
     /* LED always off */
     shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
 
+    /* Fork display process (handles rendering + scrolling independently) */
+    state.display_fd = displayd_start(state.hw);
+    if (state.display_fd < 0)
+        fprintf(stderr, "Warning: display process failed to start\n");
+
     /* Start AirPlay receiver (always advertising) */
     if (airplay_init("Mr Noisy") < 0)
         fprintf(stderr, "Warning: AirPlay init failed\n");
-
-    /* Start with blank display */
-    shelbourne_display_clear(state.hw);
-    shelbourne_display_flush(state.hw);
 
     /* Main loop */
     while (!state.cmd_quit) {
@@ -1454,25 +1293,14 @@ int main(int argc, char *argv[])
         } else if (src && src->type == SRC_DIR) {
             play_usb(src);
         } else {
-            /* Idle — show clock */
-            display_update();
+            /* Idle — display process handles clock refresh */
+            send_display_msg(0);
             while (!INTERRUPTED()) {
                 usleep(100000);
                 keypad_poll();
-                /* Check for incoming AirPlay stream */
                 if (airplay_is_streaming()) {
                     state.cmd_airplay = 1;
                     break;
-                }
-                /* Refresh clock every ~10s */
-                static int idle_ticks;
-                if (++idle_ticks >= 100) {
-                    idle_ticks = 0;
-                    state.display_dirty = 1;
-                }
-                if (state.display_dirty) {
-                    state.display_dirty = 0;
-                    display_update();
                 }
             }
         }
@@ -1505,6 +1333,10 @@ int main(int argc, char *argv[])
 
     /* Cleanup */
     printf("\nShutting down...\n");
+
+    /* Stop display process, then show goodbye directly */
+    displayd_stop(state.display_fd);
+    state.display_fd = -1;
     shelbourne_display_clear(state.hw);
     fb_center_2x(20, "Goodbye");
     shelbourne_display_flush(state.hw);
