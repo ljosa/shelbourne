@@ -6,4 +6,11 @@
     <arg>129.6.15.28</arg>
   </daemon>
   <daemon name="/mnt/nv/player"/>
+  <daemon name="/mnt/nv/shairport-sync">
+    <arg>-c</arg>
+    <arg>/mnt/nv/shairport-sync.conf</arg>
+    <arg>-o</arg>
+    <arg>pipe</arg>
+    <arg>-v</arg>
+  </daemon>
 </ShepherdConfig>

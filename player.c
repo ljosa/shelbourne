@@ -15,6 +15,7 @@
 #include "display.h"
 #include "net.h"
 #include "sun.h"
+#include "airplay.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -153,6 +154,7 @@ static struct {
     volatile int cmd_off;
     volatile int cmd_aux;
     volatile int cmd_preset;  /* 0-5, or -1 for none */
+    volatile int cmd_airplay; /* set when AirPlay stream detected */
 
     /* Display */
     int display_dirty;          /* immediate refresh (keypress, mode change) */
@@ -289,7 +291,11 @@ static void display_update(void)
     shelbourne_display_clear(state.hw);
     const source_t *src = active_source();
 
-    if (state.active_preset < 0) {
+    if (airplay_is_streaming() && state.playing) {
+        /* AirPlay mode */
+        fb_center_4x(20, "AirPlay");
+
+    } else if (state.active_preset < 0) {
         /* AUX mode — full-screen logo */
         display_logo(logo_aux);
 
@@ -627,12 +633,17 @@ static void keypad_poll(void)
     if (state.vol_bar_active && !vol_bar_visible()) {
         state.display_dirty = 1;
     }
+
+    /* Detect incoming AirPlay stream */
+    if (airplay_is_streaming() && !state.cmd_airplay)
+        state.cmd_airplay = 1;
 }
 
 /* ── Interrupt check macro ─────────────────────────────────────── */
 
 #define INTERRUPTED() \
-    (state.cmd_quit || state.cmd_off || state.cmd_aux || state.cmd_preset >= 0)
+    (state.cmd_quit || state.cmd_off || state.cmd_aux || \
+     state.cmd_preset >= 0 || state.cmd_airplay)
 
 /* ── Radio streaming ───────────────────────────────────────────── */
 
@@ -1323,6 +1334,51 @@ static void play_podcast(const source_t *src)
     }
 }
 
+/* ── AirPlay playback ──────────────────────────────────────────── */
+
+static void play_airplay(void)
+{
+    printf("Entering AirPlay mode\n");
+    state.playing = 1;
+    display_update();
+
+    audio_reset();
+
+    int16_t pcm_buf[4096];  /* temp buffer for PCM from ring */
+
+    while (!state.cmd_quit && !state.cmd_off && state.cmd_preset < 0
+           && !state.cmd_aux) {
+        if (!airplay_is_streaming()) {
+            printf("AirPlay: stream ended\n");
+            break;
+        }
+
+        int n = airplay_read(pcm_buf, sizeof(pcm_buf));
+        if (n > 0) {
+            /* AirPlay delivers 16-bit stereo, typically 44100 Hz */
+            int samples = n / 4;  /* 4 bytes per sample (2 ch × 16 bit) */
+            convert_and_write((mp3d_sample_t *)pcm_buf, samples, 2, 44100);
+            shelbourne_audio_wait(state.hw);
+        } else if (n == 0) {
+            /* No data available, poll briefly */
+            usleep(5000);
+        } else {
+            break;  /* stream ended */
+        }
+
+        keypad_poll();
+
+        if (state.display_dirty) {
+            state.display_dirty = 0;
+            display_update();
+        }
+    }
+
+    shelbourne_audio_drain(state.hw);
+    state.playing = 0;
+    printf("Leaving AirPlay mode\n");
+}
+
 /* ── Signal handling ───────────────────────────────────────────── */
 
 static void sig_handler(int sig)
@@ -1353,8 +1409,14 @@ int main(int argc, char *argv[])
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Initialize hardware */
-    shelbourne_stop_stock_processes();
+    /* Kill stock audio processes (harmless if none running).
+     * Don't freeze shepherdd — with the shepherd override config,
+     * it manages player + airplayd and should stay running. */
+    system("killall -9 APServer BoseApp STSCertified UpnpSource "
+           "WebServer CLIServer NetManager scmmond "
+           "SoftwareUpdate IoT TPDA LegacyProduct "
+           "PtsServer microbswitch httpd 2>/dev/null");
+    sleep(1);
     state.hw = shelbourne_init();
     if (!state.hw) {
         fprintf(stderr, "Hardware init failed\n");
@@ -1367,6 +1429,10 @@ int main(int argc, char *argv[])
     /* LED always off */
     shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
 
+    /* Start AirPlay receiver (always advertising) */
+    if (airplay_init("Mr Noisy") < 0)
+        fprintf(stderr, "Warning: AirPlay init failed\n");
+
     /* Start with blank display */
     shelbourne_display_clear(state.hw);
     shelbourne_display_flush(state.hw);
@@ -1375,7 +1441,11 @@ int main(int argc, char *argv[])
     while (!state.cmd_quit) {
         const source_t *src = active_source();
 
-        if (state.active_preset < 0) {
+        if (state.cmd_airplay) {
+            state.cmd_airplay = 0;
+            play_airplay();
+            continue;
+        } else if (state.active_preset < 0) {
             play_aux();
         } else if (src && src->type == SRC_RADIO) {
             play_radio(src);
@@ -1389,6 +1459,11 @@ int main(int argc, char *argv[])
             while (!INTERRUPTED()) {
                 usleep(100000);
                 keypad_poll();
+                /* Check for incoming AirPlay stream */
+                if (airplay_is_streaming()) {
+                    state.cmd_airplay = 1;
+                    break;
+                }
                 /* Refresh clock every ~10s */
                 static int idle_ticks;
                 if (++idle_ticks >= 100) {
@@ -1435,6 +1510,7 @@ int main(int argc, char *argv[])
     shelbourne_display_flush(state.hw);
     sleep(1);
 
+    airplay_stop();
     shelbourne_shutdown(state.hw);
     return 0;
 }

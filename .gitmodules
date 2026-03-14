@@ -1,0 +1,6 @@
+[submodule "shairplay"]
+	path = shairplay
+	url = https://github.com/juhovh/shairplay.git
+[submodule "tinysvcmdns"]
+	path = tinysvcmdns
+	url = https://github.com/geekman/tinysvcmdns.git
