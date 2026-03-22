@@ -10,6 +10,7 @@ void display_init(shelbourne_t *hw);
 /* Small text (proportional, ~14px) — for labels, track index, volume */
 void fb_putstr(int x, int y, const char *s);
 int fb_text_width(const char *s);  /* measure width in pixels */
+void fb_center_1x(int y, const char *s);  /* centered small text */
 
 /* Medium text (proportional, ~19px) — for station names, metadata */
 void fb_center_2x(int y, const char *s);

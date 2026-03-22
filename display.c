@@ -134,6 +134,11 @@ int fb_text_width(const char *s)
     return string_width(&font_small, s);
 }
 
+void fb_center_1x(int y, const char *s)
+{
+    draw_centered(&font_small, y, s);
+}
+
 void fb_center_2x(int y, const char *s)
 {
     draw_centered(&font_medium, y, s);

@@ -3,7 +3,7 @@
  *
  * Controls:
  *   Volume Up/Down  = Adjust volume (+/- 5, minimum 5)
- *   Preset 1-4      = Select source (press again to cycle)
+ *   Preset 1-6      = Select source (press again to cycle)
  *   AUX             = Switch to AUX input
  *   Power           = Return to idle (clock) screen
  */
@@ -17,6 +17,7 @@
 #include "sun.h"
 #include "airplay.h"
 #include "displayd.h"
+#include "mqtt.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -55,6 +56,7 @@ typedef struct {
     const char *path;
     const char *dir;
     const char *feed_url;   /* RSS feed URL for podcasts */
+    const char *title_filter; /* only play episodes whose title contains this (case-insensitive) */
     const uint8_t *logo;
 } source_t;
 
@@ -81,14 +83,15 @@ static const source_t p3_sources[] = {
     { SRC_RADIO, "DEF CON",     "ice1.somafm.com",                80, "/defcon-128-mp3",      .logo = logo_defcon },
 };
 
-/* Preset 4: USB music */
-static const source_t p4_sources[] = {
+/* Preset 5: USB music */
+static const source_t p5_sources[] = {
     { SRC_DIR, "USB Music", .dir = "/media/sda1", .logo = logo_usb },
 };
 
 /* Preset 6: Weather podcast */
 static const source_t p6_sources[] = {
-    { SRC_PODCAST, "Eye on Sky", .feed_url = "podcasts.vpr.net/eye-on-the-sky", .logo = logo_eots },
+    { SRC_PODCAST, "Eye on the Sky", .feed_url = "podcasts.vpr.net/eye-on-the-sky",
+      .title_filter = "forecast", .logo = logo_eots },
 };
 
 typedef struct {
@@ -101,8 +104,8 @@ static preset_t presets[NUM_PRESETS] = {
     { p1_sources, sizeof(p1_sources)/sizeof(p1_sources[0]), 0 },
     { p2_sources, sizeof(p2_sources)/sizeof(p2_sources[0]), 0 },
     { p3_sources, sizeof(p3_sources)/sizeof(p3_sources[0]), 0 },
-    { p4_sources, sizeof(p4_sources)/sizeof(p4_sources[0]), 0 },
     { NULL, 0, 0 },
+    { p5_sources, sizeof(p5_sources)/sizeof(p5_sources[0]), 0 },
     { p6_sources, sizeof(p6_sources)/sizeof(p6_sources[0]), 0 },
 };
 
@@ -157,6 +160,13 @@ static struct {
 
     /* Display process */
     int display_fd;             /* pipe to display process */
+
+    /* Outside temperature (from MQTT, written by background thread).
+     * volatile is sufficient on this single-core ARM target;
+     * would need atomics/mutex on SMP. */
+    volatile float outside_temp_c;   /* most recent reading in Celsius */
+    volatile time_t outside_temp_time; /* time of arrival */
+    volatile int outside_temp_valid;
 } state;
 
 /* ── Resampler ─────────────────────────────────────────────────── */
@@ -223,6 +233,41 @@ static const source_t *active_source(void)
     return &p->sources[p->current];
 }
 
+/* ── MQTT temperature callback ─────────────────────────────────── */
+
+#define TEMP_MAX_AGE_SEC 3600  /* 1 hour */
+
+static void mqtt_temp_callback(const char *payload, int len)
+{
+    (void)len;
+    /*
+     * Parse {"SHT3X-0x44":{"Temperature":2.5,...},...}
+     * Minimal JSON extraction — find "Temperature": followed by a number.
+     */
+    const char *key = "\"Temperature\":";
+    const char *p = strstr(payload, key);
+    if (!p) return;
+    p += strlen(key);
+
+    char *endp;
+    float temp_c = strtof(p, &endp);
+    if (endp == p) return;  /* not a valid number */
+    state.outside_temp_c = temp_c;
+    state.outside_temp_time = time(NULL);
+    state.outside_temp_valid = 1;
+    printf("MQTT: outside temperature %.1f°C (%.0f°F)\n",
+           temp_c, temp_c * 9.0f / 5.0f + 32.0f);
+}
+
+static void format_temp_str(char *buf, int buflen)
+{
+    buf[0] = '\0';
+    if (!state.outside_temp_valid) return;
+    if (time(NULL) - state.outside_temp_time > TEMP_MAX_AGE_SEC) return;
+    int temp_f = (int)roundf(state.outside_temp_c * 9.0f / 5.0f + 32.0f);
+    snprintf(buf, buflen, "%d \xc2\xb0" "F outside", temp_f);
+}
+
 /*
  * Send current display state to the display process.
  * include_volume: if true, show volume bar overlay.
@@ -269,6 +314,7 @@ static void send_display_msg(int include_volume)
         msg.mode = DISP_CLOCK;
     }
 
+    format_temp_str(msg.temp_str, sizeof(msg.temp_str));
     displayd_send(state.display_fd, &msg);
 }
 
@@ -938,9 +984,29 @@ static void play_aux(void)
 
 /* ── Podcast ───────────────────────────────────────────────────── */
 
+/* Case-insensitive substring search (portable). */
+static const char *ci_strstr(const char *haystack, const char *needle)
+{
+    if (!needle[0]) return haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack, *n = needle;
+        while (*n) {
+            char hc = *h, nc = *n;
+            if (hc >= 'A' && hc <= 'Z') hc += 32;
+            if (nc >= 'A' && nc <= 'Z') nc += 32;
+            if (hc != nc) break;
+            h++; n++;
+        }
+        if (!*n) return haystack;
+    }
+    return NULL;
+}
+
 /*
- * Fetch RSS feed via curl (HTTPS required), find the first
- * <enclosure url="..."/> and <pubDate>...</pubDate> in the first <item>.
+ * Fetch RSS feed via curl (HTTPS required), find the first <item> whose
+ * <title> matches the source's title_filter (case-insensitive), then
+ * extract <enclosure url="..."/> and <pubDate>...</pubDate>.
+ * If no title_filter is set, uses the first <item>.
  */
 static int podcast_fetch_latest(const source_t *src)
 {
@@ -972,9 +1038,31 @@ static int podcast_fetch_latest(const source_t *src)
         return -1;
     }
 
-    /* Find first <item> */
-    char *item = strstr(rss, "<item");
-    if (!item) { free(rss); return -1; }
+    /* Find the first <item> matching the title filter */
+    char *item = rss;
+    for (;;) {
+        item = strstr(item, "<item");
+        if (!item) { free(rss); return -1; }
+
+        if (!src->title_filter) break;
+
+        /* Extract <title> from this item */
+        char *title_tag = strstr(item, "<title>");
+        char *next_item = strstr(item + 1, "<item");
+        if (title_tag && (!next_item || title_tag < next_item)) {
+            char *title_end = strstr(title_tag + 7, "</title>");
+            if (title_end) {
+                char title[256];
+                int tlen = title_end - (title_tag + 7);
+                if (tlen >= (int)sizeof(title)) tlen = sizeof(title) - 1;
+                memcpy(title, title_tag + 7, tlen);
+                title[tlen] = '\0';
+                if (ci_strstr(title, src->title_filter))
+                    break;
+            }
+        }
+        item++;
+    }
 
     /* Find <enclosure url="..." */
     char *enc = strstr(item, "<enclosure");
@@ -1184,6 +1272,10 @@ static void play_airplay(void)
     state.playing = 1;
     send_display_msg(0);
 
+    /* Phone controls volume — bypass device gain */
+    int saved_gain = state.vol_gain;
+    state.vol_gain = 65536;
+
     audio_reset();
 
     int16_t pcm_buf[4096];  /* temp buffer for PCM from ring */
@@ -1209,9 +1301,11 @@ static void play_airplay(void)
         }
 
         keypad_poll();
+        state.vol_gain = 65536;  /* phone controls volume */
     }
 
     shelbourne_audio_drain(state.hw);
+    state.vol_gain = saved_gain;
     state.playing = 0;
     printf("Leaving AirPlay mode\n");
 }
@@ -1276,6 +1370,11 @@ int main(int argc, char *argv[])
     if (airplay_init("Mr Noisy") < 0)
         fprintf(stderr, "Warning: AirPlay init failed\n");
 
+    /* Start MQTT for outside temperature */
+    if (mqtt_start("192.168.2.71", 1883,
+                    "tele/outside/SENSOR", mqtt_temp_callback) < 0)
+        fprintf(stderr, "Warning: MQTT init failed\n");
+
     /* Main loop */
     while (!state.cmd_quit) {
         const source_t *src = active_source();
@@ -1293,14 +1392,20 @@ int main(int argc, char *argv[])
         } else if (src && src->type == SRC_DIR) {
             play_usb(src);
         } else {
-            /* Idle — display process handles clock refresh */
+            /* Idle — display process handles clock refresh;
+             * re-send every 30s so temperature updates propagate */
             send_display_msg(0);
+            int idle_count = 0;
             while (!INTERRUPTED()) {
                 usleep(100000);
                 keypad_poll();
                 if (airplay_is_streaming()) {
                     state.cmd_airplay = 1;
                     break;
+                }
+                if (++idle_count >= 300) {  /* 30 seconds */
+                    send_display_msg(0);
+                    idle_count = 0;
                 }
             }
         }
@@ -1342,6 +1447,7 @@ int main(int argc, char *argv[])
     shelbourne_display_flush(state.hw);
     sleep(1);
 
+    mqtt_stop();
     airplay_stop();
     shelbourne_shutdown(state.hw);
     return 0;

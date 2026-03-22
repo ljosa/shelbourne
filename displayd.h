@@ -26,6 +26,7 @@ typedef struct {
     char text1[DISP_TEXT_LEN];
     char text2[DISP_TEXT_LEN];
     char text3[DISP_TEXT_LEN];
+    char temp_str[32]; /* e.g. "38 ºF outside", or "" if unavailable */
 } display_msg_t;
 
 /*

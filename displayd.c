@@ -128,7 +128,6 @@ static int render(void)
                 char clk[6];
                 snprintf(clk, sizeof(clk), "%d:%02d",
                          tm->tm_hour, tm->tm_min);
-                fb_center_4x(20, clk);
 
                 static const char *days[] =
                     {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
@@ -139,7 +138,17 @@ static int render(void)
                 snprintf(date, sizeof(date), "%s %s %d",
                          days[tm->tm_wday], months[tm->tm_mon],
                          tm->tm_mday);
-                fb_center_2x(62, date);
+
+                if (cur.temp_str[0]) {
+                    /* Layout A: clock+date top, temp bottom */
+                    fb_center_4x(4, clk);
+                    fb_center_2x(42, date);
+                    fb_center_1x(82, cur.temp_str);
+                } else {
+                    /* No temperature — original centered layout */
+                    fb_center_4x(20, clk);
+                    fb_center_2x(62, date);
+                }
             }
         }
         break;
