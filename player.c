@@ -18,6 +18,7 @@
 #include "airplay.h"
 #include "displayd.h"
 #include "mqtt.h"
+#include "adsb.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -43,6 +44,10 @@
 #define VOL_STEP        5
 #define VOL_BAR_MS      2000   /* volume bar display duration */
 #define NUM_PRESETS     6
+
+/* Burlington VT */
+#define LAT  44.0247
+#define LON -73.0111
 
 /* ── Source model ──────────────────────────────────────────────── */
 
@@ -157,6 +162,7 @@ static struct {
     volatile int cmd_aux;
     volatile int cmd_preset;  /* 0-5, or -1 for none */
     volatile int cmd_airplay; /* set when AirPlay stream detected */
+    volatile int cmd_aircraft; /* volume-up in idle = aircraft lookup */
 
     /* Display process */
     int display_fd;             /* pipe to display process */
@@ -233,6 +239,13 @@ static const source_t *active_source(void)
     return &p->sources[p->current];
 }
 
+/* Forward declarations */
+static void keypad_poll(void);
+static void send_display_msg(int include_volume);
+#define INTERRUPTED() \
+    (state.cmd_quit || state.cmd_off || state.cmd_aux || \
+     state.cmd_preset >= 0 || state.cmd_airplay)
+
 /* ── MQTT temperature callback ─────────────────────────────────── */
 
 #define TEMP_MAX_AGE_SEC 3600  /* 1 hour */
@@ -266,6 +279,64 @@ static void format_temp_str(char *buf, int buflen)
     if (time(NULL) - state.outside_temp_time > TEMP_MAX_AGE_SEC) return;
     int temp_f = (int)roundf(state.outside_temp_c * 9.0f / 5.0f + 32.0f);
     snprintf(buf, buflen, "%d \xc2\xb0" "F outside", temp_f);
+}
+
+/* ── Aircraft lookup ───────────────────────────────────────────── */
+
+#define AIRCRAFT_DISPLAY_SEC 30
+
+static void show_aircraft(void)
+{
+    if (state.display_fd < 0) return;
+
+    /* Show radar sweep animation while fetching */
+    display_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.mode = DISP_AIRCRAFT_SWEEP;
+    msg.volume = -1;
+    displayd_send(state.display_fd, &msg);
+
+    printf("Looking up nearby aircraft...\n");
+    adsb_result_t result;
+    int ok = adsb_query(LAT, LON, 25, &result);
+
+    /* Build display message with aircraft data */
+    memset(&msg, 0, sizeof(msg));
+    msg.volume = -1;
+
+    if (ok < 0 || result.count == 0) {
+        msg.mode = DISP_AIRCRAFT;
+        msg.ac_count = 0;
+        msg.ac_radius_nm = 25;
+    } else {
+        msg.mode = DISP_AIRCRAFT;
+        msg.ac_count = result.count;
+        msg.ac_radius_nm = result.radius_nm;
+        for (int i = 0; i < result.count && i < DISP_MAX_AC; i++) {
+            const adsb_aircraft_t *src = &result.ac[i];
+            disp_aircraft_t *dst = &msg.ac[i];
+            memcpy(dst->callsign, src->callsign, sizeof(dst->callsign));
+            memcpy(dst->type, src->type, sizeof(dst->type));
+            dst->alt_100 = (src->alt >= 0) ? (int16_t)(src->alt / 100) : -1;
+            dst->gs = (src->gs >= 0) ? (int16_t)src->gs : -1;
+            dst->track = (src->track >= 0) ? (int16_t)src->track : -1;
+            dst->dst_x10 = (int16_t)src->dst_nm_x10;
+            dst->dir = (src->dir >= 0) ? (int16_t)src->dir : -1;
+        }
+    }
+
+    displayd_send(state.display_fd, &msg);
+
+    /* Hold display for 30 seconds, then return to idle */
+    for (int w = 0; w < AIRCRAFT_DISPLAY_SEC * 10 && !INTERRUPTED(); w++) {
+        usleep(100000);
+        keypad_poll();
+        /* Any button press exits early */
+        if (state.cmd_off || state.cmd_preset >= 0 ||
+            state.cmd_aux || state.cmd_aircraft)
+            break;
+    }
+    state.cmd_aircraft = 0;
 }
 
 /*
@@ -533,7 +604,11 @@ static void keypad_poll(void)
             state.cmd_off = 1;
             break;
         case SHELBOURNE_KEY_VOLUME_UP:
-            if (state.volume < 100) {
+            if (state.active_preset == NUM_PRESETS &&
+                !airplay_is_streaming()) {
+                /* Idle mode — trigger aircraft lookup */
+                state.cmd_aircraft = 1;
+            } else if (state.volume < 100) {
                 state.volume += VOL_STEP;
                 if (state.volume > 100) state.volume = 100;
                 state.vol_gain = shelbourne_volume_to_gain(state.volume);
@@ -568,12 +643,6 @@ static void keypad_poll(void)
     if (airplay_is_streaming() && !state.cmd_airplay)
         state.cmd_airplay = 1;
 }
-
-/* ── Interrupt check macro ─────────────────────────────────────── */
-
-#define INTERRUPTED() \
-    (state.cmd_quit || state.cmd_off || state.cmd_aux || \
-     state.cmd_preset >= 0 || state.cmd_airplay)
 
 /* ── Radio streaming ───────────────────────────────────────────── */
 
@@ -1402,6 +1471,13 @@ int main(int argc, char *argv[])
                 if (airplay_is_streaming()) {
                     state.cmd_airplay = 1;
                     break;
+                }
+                if (state.cmd_aircraft) {
+                    state.cmd_aircraft = 0;
+                    show_aircraft();
+                    send_display_msg(0);  /* back to clock */
+                    idle_count = 0;
+                    continue;
                 }
                 if (++idle_count >= 300) {  /* 30 seconds */
                     send_display_msg(0);

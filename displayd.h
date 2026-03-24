@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define DISP_TEXT_LEN 256
+#define DISP_MAX_AC   16
 
 enum disp_mode {
     DISP_RADIO,
@@ -14,7 +15,20 @@ enum disp_mode {
     DISP_AIRPLAY,
     DISP_CLOCK,
     DISP_BLANK,
+    DISP_AIRCRAFT_SWEEP,  /* radar sweep animation (waiting for data) */
+    DISP_AIRCRAFT,        /* radar with aircraft dots + data */
 };
+
+/* Compact aircraft data for pipe transfer */
+typedef struct {
+    char callsign[12];
+    char type[8];
+    int16_t alt_100;    /* altitude / 100 (saves space), -1 = unknown */
+    int16_t gs;         /* ground speed knots, -1 = unknown */
+    int16_t track;      /* heading degrees, -1 = unknown */
+    int16_t dst_x10;    /* distance in tenths of nm */
+    int16_t dir;        /* bearing degrees, -1 = unknown */
+} disp_aircraft_t;
 
 typedef struct {
     int mode;
@@ -26,7 +40,11 @@ typedef struct {
     char text1[DISP_TEXT_LEN];
     char text2[DISP_TEXT_LEN];
     char text3[DISP_TEXT_LEN];
-    char temp_str[32]; /* e.g. "38 ºF outside", or "" if unavailable */
+    char temp_str[32]; /* e.g. "38 °F outside", or "" if unavailable */
+    /* Aircraft data (only used when mode == DISP_AIRCRAFT) */
+    int ac_count;
+    int ac_radius_nm;
+    disp_aircraft_t ac[DISP_MAX_AC];
 } display_msg_t;
 
 /*
