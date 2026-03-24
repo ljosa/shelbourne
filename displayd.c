@@ -126,7 +126,7 @@ static int render(void)
             struct tm *tm = localtime(&now);
             if (tm) {
                 char clk[6];
-                snprintf(clk, sizeof(clk), "%d:%02d",
+                snprintf(clk, sizeof(clk), "%02d:%02d",
                          tm->tm_hour, tm->tm_min);
 
                 static const char *days[] =
