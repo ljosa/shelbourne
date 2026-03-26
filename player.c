@@ -44,10 +44,82 @@
 #define VOL_STEP        5
 #define VOL_BAR_MS      2000   /* volume bar display duration */
 #define NUM_PRESETS     6
+#define CONFIG_PATH     "/mnt/nv/player.conf"
+#define MAX_CFG_LINE    512
 
-/* Burlington VT */
-#define LAT  44.0247
-#define LON -73.0111
+static struct {
+    char name[64];
+    char timezone[64];
+    double lat;
+    double lon;
+    char mqtt_broker[128];
+    int  mqtt_port;
+    char mqtt_topic[128];
+} config;
+
+static void config_load(const char *path)
+{
+    /* Defaults (Mr Noisy / Burlington VT) */
+    strncpy(config.name, "SoundTouch", sizeof(config.name) - 1);
+    strncpy(config.timezone, "US/Eastern", sizeof(config.timezone) - 1);
+    config.lat = 44.0247;
+    config.lon = -73.0111;
+    config.mqtt_broker[0] = '\0';
+    config.mqtt_port = 1883;
+    config.mqtt_topic[0] = '\0';
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "No config file at %s, using defaults\n", path);
+        return;
+    }
+
+    char line[MAX_CFG_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0') continue;
+
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+
+        /* Trim key */
+        char *end = key + strlen(key) - 1;
+        while (end > key && (*end == ' ' || *end == '\t')) *end-- = '\0';
+
+        /* Trim value leading whitespace */
+        while (*val == ' ' || *val == '\t') val++;
+
+        if (strcmp(key, "name") == 0)
+            snprintf(config.name, sizeof(config.name), "%s", val);
+        else if (strcmp(key, "timezone") == 0)
+            snprintf(config.timezone, sizeof(config.timezone), "%s", val);
+        else if (strcmp(key, "lat") == 0)
+            config.lat = atof(val);
+        else if (strcmp(key, "lon") == 0)
+            config.lon = atof(val);
+        else if (strcmp(key, "mqtt_broker") == 0)
+            snprintf(config.mqtt_broker, sizeof(config.mqtt_broker), "%s", val);
+        else if (strcmp(key, "mqtt_port") == 0)
+            config.mqtt_port = atoi(val);
+        else if (strcmp(key, "mqtt_topic") == 0)
+            snprintf(config.mqtt_topic, sizeof(config.mqtt_topic), "%s", val);
+    }
+
+    fclose(f);
+    printf("Config: name=%s tz=%s lat=%.4f lon=%.4f\n",
+           config.name, config.timezone, config.lat, config.lon);
+    if (config.mqtt_broker[0])
+        printf("Config: mqtt=%s:%d topic=%s\n",
+               config.mqtt_broker, config.mqtt_port, config.mqtt_topic);
+}
 
 /* ── Source model ──────────────────────────────────────────────── */
 
@@ -298,7 +370,7 @@ static void show_aircraft(void)
 
     printf("Looking up nearby aircraft...\n");
     adsb_result_t result;
-    int ok = adsb_query(LAT, LON, 25, &result);
+    int ok = adsb_query(config.lat, config.lon, 25, &result);
 
     /* Build display message with aircraft data */
     memset(&msg, 0, sizeof(msg));
@@ -1395,7 +1467,8 @@ int main(int argc, char *argv[])
 
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
-    setenv("TZ", "US/Eastern", 1);
+    config_load(CONFIG_PATH);
+    setenv("TZ", config.timezone, 1);
     tzset();
 
     memset(&state, 0, sizeof(state));
@@ -1412,11 +1485,14 @@ int main(int argc, char *argv[])
 
     /* Kill stock audio processes (harmless if none running).
      * Don't freeze shepherdd — with the shepherd override config,
-     * it manages player + airplayd and should stay running. */
+     * it manages player + airplayd and should stay running.
+     * Also restart shairport-sync to force fresh mDNS registration
+     * (shepherd will respawn it). */
     system("killall -9 APServer BoseApp STSCertified UpnpSource "
            "WebServer CLIServer NetManager scmmond "
            "SoftwareUpdate IoT TPDA LegacyProduct "
            "PtsServer microbswitch httpd 2>/dev/null");
+    system("killall shairport-sync 2>/dev/null");
     sleep(1);
     state.hw = shelbourne_init();
     if (!state.hw) {
@@ -1431,18 +1507,20 @@ int main(int argc, char *argv[])
     shelbourne_led_set(state.hw, SHELBOURNE_LED_OFF);
 
     /* Fork display process (handles rendering + scrolling independently) */
-    state.display_fd = displayd_start(state.hw);
+    state.display_fd = displayd_start(state.hw, config.lat, config.lon);
     if (state.display_fd < 0)
         fprintf(stderr, "Warning: display process failed to start\n");
 
     /* Start AirPlay receiver (always advertising) */
-    if (airplay_init("Mr Noisy") < 0)
+    if (airplay_init(config.name) < 0)
         fprintf(stderr, "Warning: AirPlay init failed\n");
 
     /* Start MQTT for outside temperature */
-    if (mqtt_start("192.168.2.71", 1883,
-                    "tele/outside/SENSOR", mqtt_temp_callback) < 0)
-        fprintf(stderr, "Warning: MQTT init failed\n");
+    if (config.mqtt_broker[0] && config.mqtt_topic[0]) {
+        if (mqtt_start(config.mqtt_broker, config.mqtt_port,
+                        config.mqtt_topic, mqtt_temp_callback) < 0)
+            fprintf(stderr, "Warning: MQTT init failed\n");
+    }
 
     /* Main loop */
     while (!state.cmd_quit) {

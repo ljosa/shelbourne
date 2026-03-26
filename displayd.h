@@ -50,8 +50,9 @@ typedef struct {
 /*
  * Fork display process. Returns pipe write fd (non-blocking).
  * Must be called after display_init().
+ * lat/lon are used for sun position (clock display).
  */
-int displayd_start(shelbourne_t *hw);
+int displayd_start(shelbourne_t *hw, double lat, double lon);
 
 /* Send display state. Non-blocking; drops if pipe full. */
 void displayd_send(int fd, const display_msg_t *msg);

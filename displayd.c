@@ -28,10 +28,8 @@
 #define CLOCK_REFRESH_MS 30000
 #define SWEEP_POLL_MS    80    /* ~12 fps for radar sweep */
 
-/* Burlington VT */
-#define LAT  44.0247
-#define LON -73.0111
-
+static double disp_lat;
+static double disp_lon;
 static shelbourne_t *disp_hw;
 static display_msg_t cur;
 static int vol_level;
@@ -329,7 +327,7 @@ static int render(void)
         break;
 
     case DISP_CLOCK:
-        if (sun_clock_visible(LAT, LON)) {
+        if (sun_clock_visible(disp_lat, disp_lon)) {
             time_t now = time(NULL);
             struct tm *tm = localtime(&now);
             if (tm) {
@@ -464,11 +462,14 @@ static void displayd_main(shelbourne_t *hw, int pipe_rd)
     _exit(0);
 }
 
-int displayd_start(shelbourne_t *hw)
+int displayd_start(shelbourne_t *hw, double lat, double lon)
 {
     int pipefd[2];
     if (pipe(pipefd) < 0)
         return -1;
+
+    disp_lat = lat;
+    disp_lon = lon;
 
     pid_t pid = fork();
     if (pid < 0) {
