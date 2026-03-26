@@ -6,8 +6,8 @@ for text drawn by the player at runtime.  AUX and USB logos are
 full-height since they don't need dynamic text below.
 """
 
-from PIL import Image, ImageDraw, ImageFont
-import math, os
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+import math, os, urllib.request
 
 W, H = 128, 100
 HALF = 50  # radio logos use top half only
@@ -148,26 +148,28 @@ def make_logo_somafm(name, subtitle):
     return img
 
 def make_logo_eots():
-    """Eye on the Sky — Vermont weather podcast."""
-    img = Image.new('L', (W, H), 0)
-    draw = ImageDraw.Draw(img)
-    # Sun icon
-    cx, cy = 64, 18
-    r = 10
-    draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=200)
-    for angle in range(0, 360, 45):
-        import math as m
-        x0 = cx + int((r+3) * m.cos(m.radians(angle)))
-        y0 = cy + int((r+3) * m.sin(m.radians(angle)))
-        x1 = cx + int((r+7) * m.cos(m.radians(angle)))
-        y1 = cy + int((r+7) * m.sin(m.radians(angle)))
-        draw.line([(x0, y0), (x1, y1)], fill=180, width=1)
-    # Cloud
-    draw.ellipse([30, 30, 60, 44], fill=140)
-    draw.ellipse([45, 28, 80, 44], fill=160)
-    draw.ellipse([65, 32, 90, 46], fill=130)
-    draw.rectangle([35, 38, 85, 46], fill=140)
-    return img
+    """Eye on the Sky — adapt podcast artwork into top-half splash."""
+    url = "https://static.feedpress.com/logo/vpr-eye-on-the-sky.jpg"
+    cache = os.path.join(os.path.dirname(__file__), ".eots_artwork.jpg")
+    try:
+        if not os.path.exists(cache):
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as resp, open(cache, "wb") as out:
+                out.write(resp.read())
+        art = Image.open(cache).convert('L')
+        # Fit into 128x50 (top half), preserving aspect ratio
+        art = ImageOps.fit(art, (W, HALF), method=Image.LANCZOS)
+        img = Image.new('L', (W, H), 0)
+        img.paste(art, (0, 0))
+        return img
+    except Exception as e:
+        print(f"Warning: could not fetch podcast artwork ({e}), using fallback")
+        img = Image.new('L', (W, H), 0)
+        draw = ImageDraw.Draw(img)
+        big = find_bold_font(18)
+        center_text(draw, "Eye on", big, 4)
+        center_text(draw, "the Sky", big, 26)
+        return img
 
 # ── Full-height logos (AUX, USB) ───────────────────────────────
 
