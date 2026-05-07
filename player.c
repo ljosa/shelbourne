@@ -641,9 +641,6 @@ static void scan_recursive(const char *dir, int depth)
 
 static void scan_dir(const char *dir)
 {
-    if (state.usb_dir && strcmp(state.usb_dir, dir) == 0)
-        return;  /* already scanned */
-
     state.num_tracks = 0;
     scan_recursive(dir, 0);
 
@@ -1024,6 +1021,8 @@ static void play_usb(const source_t *src)
 {
     scan_dir(src->dir);
 
+    int open_failures = 0;
+
     while (!INTERRUPTED() && state.num_tracks > 0) {
         track_t *t = &state.tracks[state.current_track];
         printf("[%d/%d] %s\n", state.current_track + 1, state.num_tracks,
@@ -1035,9 +1034,18 @@ static void play_usb(const source_t *src)
         FILE *f = fopen(t->path, "rb");
         if (!f) {
             fprintf(stderr, "Cannot open %s\n", t->path);
+            open_failures++;
+            if (open_failures >= state.num_tracks) {
+                /* All tracks failed — USB probably removed */
+                fprintf(stderr, "All tracks unreadable, USB removed?\n");
+                state.num_tracks = 0;
+                state.usb_dir = NULL;
+                break;
+            }
             state.current_track = (state.current_track + 1) % state.num_tracks;
             continue;
         }
+        open_failures = 0;
 
         mp3dec_t mp3d;
         mp3dec_init(&mp3d);
