@@ -639,19 +639,17 @@ static void scan_recursive(const char *dir, int depth)
     closedir(d);
 }
 
+static int track_cmp(const void *a, const void *b)
+{
+    return strcmp(((const track_t *)a)->path, ((const track_t *)b)->path);
+}
+
 static void scan_dir(const char *dir)
 {
     state.num_tracks = 0;
     scan_recursive(dir, 0);
 
-    /* Sort by path */
-    for (int i = 0; i < state.num_tracks - 1; i++)
-        for (int j = i + 1; j < state.num_tracks; j++)
-            if (strcmp(state.tracks[i].path, state.tracks[j].path) > 0) {
-                track_t tmp = state.tracks[i];
-                state.tracks[i] = state.tracks[j];
-                state.tracks[j] = tmp;
-            }
+    qsort(state.tracks, state.num_tracks, sizeof(state.tracks[0]), track_cmp);
 
     state.usb_dir = dir;
     state.current_track = 0;
