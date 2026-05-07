@@ -29,7 +29,12 @@ SHAIRPLAY_SRC = \
 # tinysvcmdns (mDNS/Bonjour service advertisement)
 MDNS_SRC = tinysvcmdns/mdns.c tinysvcmdns/mdnsd.c
 
-.PHONY: all clean deploy deploy-shepherd revert-shepherd docker
+.PHONY: all clean deploy deploy-shepherd revert-shepherd docker test
+
+test:
+	@mkdir -p build
+	cc -O2 -Wall -o build/test_sun test_sun.c sun.c -lm
+	./build/test_sun
 
 docker:
 	@docker inspect $(IMAGE) >/dev/null 2>&1 || \

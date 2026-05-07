@@ -86,9 +86,8 @@ int sun_rise_set(int year, int month, int day,
     return 0;
 }
 
-int sun_clock_visible(double lat, double lon)
+int sun_clock_visible_at(time_t now, double lat, double lon)
 {
-    time_t now = time(NULL);
     struct tm *utc = gmtime(&now);
     if (!utc) return 1;  /* safe default: show clock */
 
@@ -104,11 +103,21 @@ int sun_clock_visible(double lat, double lon)
     double start = rise_utc - 0.5;
     double end   = set_utc  + 0.5;
 
-    /* Handle wrap-around midnight (unlikely at 44N but be safe) */
+    /* Handle wrap-around midnight UTC */
     if (start < 0.0) {
-        /* Clock visible if now > start+24 OR now < end */
+        /* Sunrise window crosses 0 UTC backwards: visible if now > start+24 OR now < end */
         return (now_utc >= start + 24.0 || now_utc <= end);
+    }
+    if (end < start) {
+        /* Sunset window crosses 24 UTC forwards (e.g. US longitudes in summer):
+         * visible if now is after start OR before end */
+        return (now_utc >= start || now_utc <= end);
     }
 
     return (now_utc >= start && now_utc <= end);
+}
+
+int sun_clock_visible(double lat, double lon)
+{
+    return sun_clock_visible_at(time(NULL), lat, lon);
 }
