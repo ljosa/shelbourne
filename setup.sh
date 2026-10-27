@@ -86,17 +86,7 @@ echo "  Config deployed"
 
 # Step 5: Generate and deploy shairport-sync.conf
 echo "Step 5: Deploying shairport-sync config..."
-cat > /tmp/shairport-sync.conf <<EOF
-general = {
-  name = "$DEVNAME";
-  port = 8080;
-  udp_port_base = 49152;
-  udp_port_range = 3;
-};
-pipe = {
-  name = "/tmp/airplay.pcm";
-};
-EOF
+./shairport-conf.sh "$CONFIG" > /tmp/shairport-sync.conf
 scp /tmp/shairport-sync.conf root@$DEVICE:$DEST/shairport-sync.conf
 rm /tmp/shairport-sync.conf
 echo "  shairport-sync.conf deployed (AirPlay name: $DEVNAME)"

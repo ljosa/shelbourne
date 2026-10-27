@@ -261,34 +261,26 @@ static void audio_reset(void)
     shelbourne_audio_reset(state.hw);
 }
 
-static int convert_and_write(const mp3d_sample_t *pcm,
-                             int in_frames, int channels, int sample_rate)
+/* Append one output frame; write it out when the buffer fills. */
+static int outbuf_put(int32_t left, int32_t right)
 {
-    if (in_frames == 0) return 0;
-    double step = (double)sample_rate / SHELBOURNE_SAMPLE_RATE;
+    outbuf[outbuf_fill * 2] = left;
+    outbuf[outbuf_fill * 2 + 1] = right;
+    outbuf_fill++;
 
-    while (resample_frac < in_frames - 1) {
-        int idx = (int)resample_frac;
-        double frac = resample_frac - idx;
-        for (int ch = 0; ch < 2; ch++) {
-            int src_ch = (ch < channels) ? ch : 0;
-            int32_t s0 = pcm[idx * channels + src_ch];
-            int32_t s1 = pcm[(idx + 1) * channels + src_ch];
-            int32_t s = (int32_t)(s0 + frac * (s1 - s0));
-            outbuf[outbuf_fill * 2 + ch] =
-                (int32_t)(((int64_t)(s << 16) * state.vol_gain) >> 16);
-        }
-        outbuf_fill++;
-        resample_frac += step;
-
-        if (outbuf_fill >= OUTBUF_FRAMES) {
-            if (shelbourne_audio_write(state.hw, outbuf, outbuf_fill) < 0)
-                return -1;
-            if (shelbourne_audio_wait(state.hw) < 0)
-                return -1;
-            outbuf_fill = 0;
-        }
+    if (outbuf_fill >= OUTBUF_FRAMES) {
+        if (shelbourne_audio_write(state.hw, outbuf, outbuf_fill) < 0)
+            return -1;
+        if (shelbourne_audio_wait(state.hw) < 0)
+            return -1;
+        outbuf_fill = 0;
     }
+    return 0;
+}
+
+/* Carry the resampler phase into the next block and write the remainder. */
+static int outbuf_finish(int in_frames)
+{
     resample_frac -= in_frames;
     if (resample_frac < 0) resample_frac = 0;
 
@@ -298,6 +290,54 @@ static int convert_and_write(const mp3d_sample_t *pcm,
         outbuf_fill = 0;
     }
     return 0;
+}
+
+static int convert_and_write(const mp3d_sample_t *pcm,
+                             int in_frames, int channels, int sample_rate)
+{
+    if (in_frames == 0) return 0;
+    double step = (double)sample_rate / SHELBOURNE_SAMPLE_RATE;
+
+    while (resample_frac < in_frames - 1) {
+        int idx = (int)resample_frac;
+        double frac = resample_frac - idx;
+        int32_t out[2];
+        for (int ch = 0; ch < 2; ch++) {
+            int src_ch = (ch < channels) ? ch : 0;
+            int32_t s0 = pcm[idx * channels + src_ch];
+            int32_t s1 = pcm[(idx + 1) * channels + src_ch];
+            int32_t s = (int32_t)(s0 + frac * (s1 - s0));
+            out[ch] = (int32_t)(((int64_t)(s << 16) * state.vol_gain) >> 16);
+        }
+        if (outbuf_put(out[0], out[1]) < 0)
+            return -1;
+        resample_frac += step;
+    }
+    return outbuf_finish(in_frames);
+}
+
+/* Same as convert_and_write(), for 32-bit stereo input (AirPlay). */
+static int convert_and_write_s32(const int32_t *pcm, int in_frames,
+                                 int sample_rate)
+{
+    if (in_frames == 0) return 0;
+    double step = (double)sample_rate / SHELBOURNE_SAMPLE_RATE;
+
+    while (resample_frac < in_frames - 1) {
+        int idx = (int)resample_frac;
+        double frac = resample_frac - idx;
+        int32_t out[2];
+        for (int ch = 0; ch < 2; ch++) {
+            int64_t s0 = pcm[idx * 2 + ch];
+            int64_t s1 = pcm[(idx + 1) * 2 + ch];
+            int64_t s = s0 + (int64_t)(frac * (double)(s1 - s0));
+            out[ch] = (int32_t)((s * state.vol_gain) >> 16);
+        }
+        if (outbuf_put(out[0], out[1]) < 0)
+            return -1;
+        resample_frac += step;
+    }
+    return outbuf_finish(in_frames);
 }
 
 /* ── Display ───────────────────────────────────────────────────── */
@@ -1413,6 +1453,19 @@ static void play_podcast(const source_t *src)
 
 /* ── AirPlay playback ──────────────────────────────────────────── */
 
+/*
+ * AirPlay audio arrives from shairport-sync as 32-bit stereo (pipe
+ * output_format "S32_LE"), so its software volume costs no resolution and
+ * its dither sits far below audibility.
+ *
+ * Noise gate: shairport-sync keeps sending dithered "silence" while paused.
+ * Tiny non-zero samples make the output stage hiss audibly, while exact
+ * zeros keep it quiet, so after a second below the threshold we send zeros
+ * until real audio returns.
+ */
+#define AIRPLAY_GATE_THRESHOLD (1 << 16) /* peak, 32-bit (about -96 dBFS) */
+#define AIRPLAY_GATE_HOLD      44100     /* frames below threshold before closing */
+
 static void play_airplay(void)
 {
     printf("Entering AirPlay mode\n");
@@ -1425,7 +1478,8 @@ static void play_airplay(void)
 
     audio_reset();
 
-    int16_t pcm_buf[4096];  /* temp buffer for PCM from ring */
+    int32_t pcm_buf[4096];  /* temp buffer for PCM from the FIFO */
+    long quiet_frames = 0;  /* consecutive frames below the gate threshold */
 
     while (!state.cmd_quit && !state.cmd_off && state.cmd_preset < 0
            && !state.cmd_aux) {
@@ -1436,9 +1490,23 @@ static void play_airplay(void)
 
         int n = airplay_read(pcm_buf, sizeof(pcm_buf));
         if (n > 0) {
-            /* AirPlay delivers 16-bit stereo, typically 44100 Hz */
-            int samples = n / 4;  /* 4 bytes per sample (2 ch × 16 bit) */
-            convert_and_write((mp3d_sample_t *)pcm_buf, samples, 2, 44100);
+            /* 32-bit stereo at 44100 Hz */
+            int frames = n / 8;  /* 8 bytes per frame (2 ch × 32 bit) */
+
+            int64_t peak = 0;
+            for (int i = 0; i < frames * 2; i++) {
+                int64_t v = pcm_buf[i] < 0 ? -(int64_t)pcm_buf[i] : pcm_buf[i];
+                if (v > peak)
+                    peak = v;
+            }
+            if (peak >= AIRPLAY_GATE_THRESHOLD)
+                quiet_frames = 0;
+            else if (quiet_frames < AIRPLAY_GATE_HOLD)
+                quiet_frames += frames;
+            if (quiet_frames >= AIRPLAY_GATE_HOLD)
+                memset(pcm_buf, 0, frames * 8);
+
+            convert_and_write_s32(pcm_buf, frames, 44100);
             shelbourne_audio_wait(state.hw);
         } else if (n == 0) {
             /* No data available, poll briefly */

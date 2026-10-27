@@ -16,7 +16,8 @@ int airplay_init(const char *name);
 int airplay_is_streaming(void);
 
 /* Read decoded PCM audio from the AirPlay stream.
- * buf:     output buffer for 16-bit interleaved stereo PCM
+ * buf:     output buffer for 32-bit interleaved stereo PCM (shairport-sync
+ *          pipe output_format "S32_LE")
  * maxlen:  buffer size in bytes
  * Returns bytes read, 0 on timeout (no data), -1 if stream ended. */
 int airplay_read(void *buf, int maxlen);

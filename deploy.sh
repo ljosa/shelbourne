@@ -23,7 +23,19 @@ scp build/airplayd root@$DEVICE:$DEST/airplayd.new
 if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
     echo "Deploying config $CONFIG..."
     scp "$CONFIG" root@$DEVICE:$DEST/player.conf
+    CONF_SRC="$CONFIG"
+else
+    # No config given: build the shairport-sync.conf from the device's own
+    # player.conf, so it always matches the player's expected audio format
+    CONF_SRC=/tmp/player-conf.$$
+    scp root@$DEVICE:$DEST/player.conf "$CONF_SRC"
 fi
+
+# The player restarts shairport-sync on startup, which picks this up
+echo "Deploying shairport-sync.conf..."
+./shairport-conf.sh "$CONF_SRC" > /tmp/shairport-sync.conf.$$
+scp /tmp/shairport-sync.conf.$$ root@$DEVICE:$DEST/shairport-sync.conf
+rm -f /tmp/shairport-sync.conf.$$ /tmp/player-conf.$$
 
 echo "Swapping binaries and restarting..."
 ssh root@$DEVICE "
