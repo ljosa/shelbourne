@@ -696,6 +696,64 @@ static void scan_dir(const char *dir)
     printf("Found %d MP3 track(s) in %s\n", state.num_tracks, dir);
 }
 
+/* ── AirPlay advertisement watchdog ────────────────────────────── */
+
+/*
+ * eth0 is the BCO's USB network link.  When that link resets, the kernel
+ * recreates eth0 and shairport-sync's mDNS multicast membership is lost, so
+ * it stops answering queries and drops out of AirPlay pickers.  If eth0 is
+ * missing the mDNS group (224.0.0.251, "FB0000E0" in /proc/net/igmp) on two
+ * checks in a row, restart shairport-sync; shepherd respawns it and it
+ * rejoins the group.
+ */
+#define MDNS_CHECK_SEC 15
+
+static int eth0_has_mdns_group(void)
+{
+    FILE *f = fopen("/proc/net/igmp", "r");
+    if (!f) return 1;  /* can't tell — don't restart */
+
+    char line[256];
+    int in_eth0 = 0, found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != '\t' && line[0] != ' ') {
+            /* Device header: "<idx>\t<name> : ..." */
+            char name[32];
+            in_eth0 = sscanf(line, "%*d %31s", name) == 1 &&
+                      strcmp(name, "eth0") == 0;
+        } else if (in_eth0 && strstr(line, "FB0000E0")) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void mdns_watchdog(void)
+{
+    static struct timespec last;
+    static int misses;
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - last.tv_sec < MDNS_CHECK_SEC)
+        return;
+    last = now;
+
+    if (eth0_has_mdns_group()) {
+        misses = 0;
+        return;
+    }
+    if (++misses < 2)
+        return;  /* may be mid-restart; check again next time */
+    misses = 0;
+
+    printf("AirPlay: eth0 lost the mDNS group, restarting shairport-sync\n");
+    if (system("killall shairport-sync 2>/dev/null") != 0)
+        fprintf(stderr, "AirPlay: shairport-sync not running\n");
+}
+
 /* ── Keypad ────────────────────────────────────────────────────── */
 
 static void keypad_poll(void)
@@ -749,6 +807,8 @@ static void keypad_poll(void)
     /* Detect incoming AirPlay stream */
     if (airplay_is_streaming() && !state.cmd_airplay)
         state.cmd_airplay = 1;
+
+    mdns_watchdog();
 }
 
 /* ── Radio streaming ───────────────────────────────────────────── */
