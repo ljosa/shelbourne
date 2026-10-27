@@ -758,10 +758,19 @@ static void mdns_watchdog(void)
 
 static void keypad_poll(void)
 {
+    static int vol_up_held, vol_down_held;
+    static int reboot_combo_active;
+    static struct timespec reboot_combo_start;
+
     shelbourne_key_event_t events[16];
     int n = shelbourne_keypad_poll(state.hw, events, 16);
 
     for (int i = 0; i < n; i++) {
+        if (events[i].key == SHELBOURNE_KEY_VOLUME_UP)
+            vol_up_held = events[i].pressed;
+        else if (events[i].key == SHELBOURNE_KEY_VOLUME_DOWN)
+            vol_down_held = events[i].pressed;
+
         if (!events[i].pressed) continue;
 
         switch (events[i].key) {
@@ -802,6 +811,23 @@ static void keypad_poll(void)
         default:
             break;
         }
+    }
+
+    /* Volume Up + Volume Down held for 3 seconds — reboot the device */
+    if (vol_up_held && vol_down_held) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (!reboot_combo_active) {
+            reboot_combo_active = 1;
+            reboot_combo_start = now;
+        } else if (now.tv_sec - reboot_combo_start.tv_sec >= 3) {
+            printf("Reboot combo held — rebooting\n");
+            sync();
+            if (system("reboot") != 0)
+                fprintf(stderr, "reboot command failed\n");
+        }
+    } else {
+        reboot_combo_active = 0;
     }
 
     /* Detect incoming AirPlay stream */
