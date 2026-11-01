@@ -233,6 +233,7 @@ static struct {
     volatile int cmd_off;
     volatile int cmd_aux;
     volatile int cmd_preset;  /* 0-5, or -1 for none */
+    volatile int cmd_skip;    /* USB button pressed again — skip to next track */
     volatile int cmd_airplay; /* set when AirPlay stream detected */
     volatile int cmd_aircraft; /* volume-up in idle = aircraft lookup */
 
@@ -803,7 +804,14 @@ static void keypad_poll(void)
         case SHELBOURNE_KEY_PRESET_2: state.cmd_preset = 1; break;
         case SHELBOURNE_KEY_PRESET_3: state.cmd_preset = 2; break;
         case SHELBOURNE_KEY_PRESET_4: state.cmd_preset = 3; break;
-        case SHELBOURNE_KEY_PRESET_5: state.cmd_preset = 4; break;
+        case SHELBOURNE_KEY_PRESET_5: {
+            const source_t *cur = active_source();
+            if (cur && cur->type == SRC_DIR)
+                state.cmd_skip = 1;   /* already in USB — skip to next track */
+            else
+                state.cmd_preset = 4;
+            break;
+        }
         case SHELBOURNE_KEY_PRESET_6: state.cmd_preset = 5; break;
         case SHELBOURNE_KEY_AUX:
             state.cmd_aux = 1;
@@ -1204,9 +1212,16 @@ static void play_usb(const source_t *src)
 
             shelbourne_audio_wait(state.hw);
             keypad_poll();
+            if (state.cmd_skip) break;  /* USB button pressed again */
         }
 
-        shelbourne_audio_drain(state.hw);
+        if (state.cmd_skip) {
+            /* Skip: discard buffered audio so the next track starts at once */
+            state.cmd_skip = 0;
+            audio_reset();
+        } else {
+            shelbourne_audio_drain(state.hw);
+        }
         fclose(f);
         state.playing = 0;
 
